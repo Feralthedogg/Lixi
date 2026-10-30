@@ -22,6 +22,7 @@ defmodule Lixi.TestCluster do
       Port.open({:spawn_executable, System.find_executable("epmd")}, [
         :binary,
         :exit_status,
+        :stderr_to_stdout,
         args: [~c"-port", Integer.to_charlist(port), ~c"-address", ~c"127.0.0.1"]
       ])
 
@@ -113,16 +114,35 @@ defmodule Lixi.TestCluster do
   def handle_info(_, state), do: {:noreply, state}
 
   def terminate(_, state) do
-    for {controller, _} <- state.peers do
-      if Process.alive?(controller), do: :peer.stop(controller)
+    try do
+      for {controller, _} <- state.peers do
+        if Process.alive?(controller), do: :peer.stop(controller)
+      end
+    after
+      stop_epmd(state.epmd)
+    end
+  end
+
+  defp stop_epmd(port) do
+    # peer:stop/1 can return before distribution unregisters. Stop only our
+    # foreground child; `epmd -kill` may refuse and leak an inherited CI pipe.
+    case Port.info(port, :os_pid) do
+      {:os_pid, pid} ->
+        System.cmd("kill", ["-TERM", Integer.to_string(pid)], stderr_to_stdout: true)
+
+        receive do
+          {^port, {:exit_status, _}} -> :ok
+          {:EXIT, ^port, _} -> :ok
+        after
+          1_000 ->
+            if Port.info(port, :os_pid) == {:os_pid, pid},
+              do: System.cmd("kill", ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+        end
+
+      _ ->
+        :ok
     end
 
-    System.cmd(System.find_executable("epmd"), [
-      "-port",
-      Integer.to_string(state.epmd_port),
-      "-kill"
-    ])
-
-    if Port.info(state.epmd), do: Port.close(state.epmd)
+    if Port.info(port), do: Port.close(port)
   end
 end

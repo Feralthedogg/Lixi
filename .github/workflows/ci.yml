@@ -131,10 +131,12 @@ jobs:
           mix compile --warnings-as-errors 2>&1 | tee test/tmp/ci-logs/compile.log
 
       - name: Run full application and four-VM fault suite
+        timeout-minutes: 8
         run: |
           mix test --seed 0 --max-cases 8 2>&1 | tee test/tmp/ci-logs/exunit.log
 
       - name: Exercise fault-sensitive suites in different orders
+        timeout-minutes: 8
         run: |
           for seed in 104729 8675309; do
             mix test test/cluster_test.exs test/upgrade_test.exs \

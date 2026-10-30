@@ -65,7 +65,7 @@ defmodule Lixi.ClusterTest do
   @tag distributed: true
   test "a three-voter quorum and a worker preserve media through session transfer and a partition" do
     harness = start_supervised!(Lixi.TestCluster)
-    %{peers: peers} = Lixi.TestCluster.info(harness)
+    %{peers: peers, epmd_port: epmd_port} = Lixi.TestCluster.info(harness)
     [{a, an}, {b, bn}, {c, cn}, {d, dn}] = peers
 
     assert await_ready(peers, System.monotonic_time(:millisecond) + 10_000)
@@ -210,6 +210,21 @@ defmodule Lixi.ClusterTest do
              :peer.call(a, Lixi.Cluster, :remember_key, [key, contender, contender, fingerprint])
 
     assert :ok = :peer.call(a, Lixi.Sessions, :destroy, [id, "456"])
+    assert :ok = stop_supervised(Lixi.TestCluster)
+
+    eventually(fn ->
+      case :gen_tcp.connect({127, 0, 0, 1}, epmd_port, [:binary, active: false], 100) do
+        {:ok, socket} ->
+          :gen_tcp.close(socket)
+          false
+
+        {:error, :econnrefused} ->
+          true
+
+        _ ->
+          false
+      end
+    end)
   end
 
   defp await_ready(peers, deadline) do
