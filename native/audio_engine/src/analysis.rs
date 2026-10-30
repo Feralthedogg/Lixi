@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use soundtouch::BPMDetect;
 use std::{f32::consts::TAU, sync::Arc};
 
-const FFT: usize = 4096;
+const FFT: usize = 16_384;
 const MAX_BEATS: usize = 16_384;
 const MAX_SAMPLES: u64 = 48_000 * 60 * 120;
 
@@ -146,13 +146,30 @@ impl Analyzer {
         }
         self.fft
             .process_with_scratch(&mut self.spectrum, &mut self.scratch);
-        for (index, value) in self.spectrum.iter().enumerate().take(FFT / 2).skip(4) {
-            let frequency = index as f64 * 48_000. / FFT as f64;
+        for index in 2..FFT / 2 - 1 {
+            let center = self.spectrum[index].norm_sqr();
+            let left = self.spectrum[index - 1].norm_sqr();
+            let right = self.spectrum[index + 1].norm_sqr();
+            if center <= 1e-12 || center <= left || center < right {
+                continue;
+            }
+            // A bin's nominal frequency can be a semitone away in the bass.
+            // Interpolate isolated Hann-window peaks in log power before folding octaves.
+            let logs = [left.max(1e-12).ln(), center.ln(), right.max(1e-12).ln()];
+            let denominator = logs[0] - 2. * logs[1] + logs[2];
+            let offset = if denominator.abs() > 1e-8 {
+                (0.5 * (logs[0] - logs[2]) / denominator).clamp(-0.5, 0.5)
+            } else {
+                0.
+            };
+            let frequency = (index as f64 + f64::from(offset)) * 48_000. / FFT as f64;
             if !(55. ..=5000.).contains(&frequency) {
                 continue;
             }
-            let midi = (69. + 12. * (frequency / 440.).log2()).round() as i32;
-            self.chroma[midi.rem_euclid(12) as usize] += f64::from(value.norm_sqr()).sqrt();
+            let midi = 69. + 12. * (frequency / 440.).log2();
+            let note = midi.round() as i32;
+            let tuning = (1. - 2. * (midi - f64::from(note)).abs()).max(0.);
+            self.chroma[note.rem_euclid(12) as usize] += f64::from(center.sqrt()) * tuning;
         }
     }
     pub fn finish(mut self) -> Report {
@@ -241,17 +258,33 @@ fn detect_key(chroma: &[f64; 12]) -> (Option<u8>, f64) {
     if sum <= 1e-12 || !sum.is_finite() {
         return (None, 0.);
     }
+    let centered = chroma.map(|value| value - sum / 12.);
+    let norm = centered
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if norm / sum < 0.03 {
+        return (None, 0.);
+    }
     let mut scores = Vec::with_capacity(24);
     for (mode, profile) in [MAJOR, MINOR].iter().enumerate() {
+        let mean = profile.iter().sum::<f64>() / 12.;
+        let profile_norm = profile
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            .sqrt();
         for root in 0..12 {
             let score: f64 = (0..12)
-                .map(|note| chroma[(root + note) % 12] * profile[note])
-                .sum();
+                .map(|note| centered[(root + note) % 12] * (profile[note] - mean))
+                .sum::<f64>()
+                / (norm * profile_norm);
             scores.push(((mode * 12 + root) as u8, score));
         }
     }
     scores.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let confidence = ((scores[0].1 - scores[1].1) / scores[0].1.max(1e-12)).clamp(0., 1.);
+    let confidence = (scores[0].1 - scores[1].1).clamp(0., 1.);
     (Some(scores[0].0), confidence)
 }
 
@@ -305,6 +338,42 @@ mod tests {
         }
         assert!((results[0] - results[1]).abs() < 0.01);
         assert!((results[0] - settings.target_lufs).abs() < 0.01);
+    }
+    #[test]
+    fn periodic_tonal_audio_reaches_the_beat_matched_transition_path() {
+        let mut analyzer = Analyzer::new().unwrap();
+        let mut pcm = [0.; 1920];
+        for block in 0..1600 {
+            for (index, stereo) in pcm.chunks_exact_mut(2).enumerate() {
+                let sample = block * 960 + index;
+                let time = sample as f32 / 48_000.;
+                let phase = (sample % 24_000) as f32 / 48_000.;
+                let kick = 0.75 * (-40. * phase).exp() * (TAU * 65.406 * phase).sin();
+                let chord = [261.626, 329.628, 391.995]
+                    .iter()
+                    .map(|frequency| (TAU * frequency * time).sin())
+                    .sum::<f32>()
+                    * 0.03;
+                stereo.fill(kick + chord);
+            }
+            analyzer.feed(&pcm).unwrap();
+        }
+        let report = analyzer.finish();
+        assert!(
+            report.bpm.is_some_and(|bpm| (bpm - 120.).abs() < 1.),
+            "{report:?}"
+        );
+        assert!(report.beat_confidence >= 0.55, "{report:?}");
+        assert_eq!(report.key, Some(0), "{report:?}");
+        let result = plan(
+            &Settings::default(),
+            Some(&report),
+            &report,
+            32_000,
+            32_000,
+            1.,
+        );
+        assert_eq!(result.mode, "beatMatched", "{report:?}");
     }
     #[test]
     fn silence_is_finite_and_does_not_trigger_amplification_or_tempo_guess() {
