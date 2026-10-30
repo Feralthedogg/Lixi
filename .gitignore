@@ -1,0 +1,13 @@
+/_build/
+/deps/
+/native/audio_engine/target/
+/erl_crash.dump
+/.elixir_ls/
+/priv/bin/lixi-audio
+/test/tmp/
+/test/runtime/
+/data/
+/.env
+/.env.*
+!/.env.example
+.DS_Store

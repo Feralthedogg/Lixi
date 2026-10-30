@@ -1,0 +1,198 @@
+# Replace the image with your Linux release image. Create Secret lixi-runtime first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lixi-control
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: lixi, component: control}
+  ports:
+    - {name: epmd, port: 4369}
+    - {name: distribution, port: 9100}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lixi-worker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: {app: lixi, component: worker}
+  ports:
+    - {name: epmd, port: 4369}
+    - {name: distribution, port: 9100}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lixi
+spec:
+  selector: {app: lixi}
+  ports:
+    - {name: http, port: 2333, targetPort: http}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lixi-control
+spec:
+  serviceName: lixi-control
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy: {type: OnDelete}
+  selector:
+    matchLabels: {app: lixi, component: control}
+  template:
+    metadata:
+      labels: {app: lixi, component: control}
+    spec:
+      terminationGracePeriodSeconds: 3600
+      securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: {app: lixi, component: control}
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: lixi
+          image: lixi:0.3.0
+          ports:
+            - {name: http, containerPort: 2333}
+            - {name: epmd, containerPort: 4369}
+            - {name: distribution, containerPort: 9100}
+          envFrom:
+            - secretRef: {name: lixi-runtime}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: RELEASE_DISTRIBUTION, value: name}
+            - {name: RELEASE_NODE, value: 'lixi@$(POD_NAME).lixi-control.$(POD_NAMESPACE).svc.cluster.local'}
+            - name: LIXI_CLUSTER_NODES
+              value: 'lixi@lixi-control-0.lixi-control.$(POD_NAMESPACE).svc.cluster.local,lixi@lixi-control-1.lixi-control.$(POD_NAMESPACE).svc.cluster.local,lixi@lixi-control-2.lixi-control.$(POD_NAMESPACE).svc.cluster.local'
+            - {name: ERL_AFLAGS, value: '-kernel inet_dist_listen_min 9100 inet_dist_listen_max 9100'}
+            - {name: LIXI_HOST, value: 0.0.0.0}
+            - {name: LIXI_DATA_DIR, value: /var/lib/lixi}
+          resources:
+            requests: {cpu: '1', memory: 512Mi}
+            limits: {memory: 2Gi}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /health/live, port: http}
+            failureThreshold: 60
+            periodSeconds: 2
+          lifecycle:
+            preStop:
+              exec: {command: [/app/bin/lixi, rpc, 'Lixi.Lifecycle.drain()']}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/lixi}
+  volumeClaimTemplates:
+    - metadata: {name: state}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lixi-control
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels: {app: lixi, component: control}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lixi-worker
+spec:
+  serviceName: lixi-worker
+  replicas: 2
+  podManagementPolicy: Parallel
+  updateStrategy: {type: OnDelete}
+  selector:
+    matchLabels: {app: lixi, component: worker}
+  template:
+    metadata:
+      labels: {app: lixi, component: worker}
+    spec:
+      terminationGracePeriodSeconds: 3600
+      securityContext: {runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001}
+      containers:
+        - name: lixi
+          image: lixi:0.3.0
+          ports:
+            - {name: http, containerPort: 2333}
+            - {name: epmd, containerPort: 4369}
+            - {name: distribution, containerPort: 9100}
+          envFrom:
+            - secretRef: {name: lixi-runtime}
+          env:
+            - name: POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - {name: RELEASE_DISTRIBUTION, value: name}
+            - {name: RELEASE_NODE, value: 'lixi@$(POD_NAME).lixi-worker.$(POD_NAMESPACE).svc.cluster.local'}
+            - name: LIXI_CLUSTER_NODES
+              value: 'lixi@lixi-control-0.lixi-control.$(POD_NAMESPACE).svc.cluster.local,lixi@lixi-control-1.lixi-control.$(POD_NAMESPACE).svc.cluster.local,lixi@lixi-control-2.lixi-control.$(POD_NAMESPACE).svc.cluster.local'
+            - {name: ERL_AFLAGS, value: '-kernel inet_dist_listen_min 9100 inet_dist_listen_max 9100'}
+            - {name: LIXI_HOST, value: 0.0.0.0}
+            - {name: LIXI_DATA_DIR, value: /var/lib/lixi}
+          resources:
+            requests: {cpu: '1', memory: 512Mi}
+            limits: {memory: 2Gi}
+          readinessProbe:
+            httpGet: {path: /health/ready, port: http}
+            periodSeconds: 3
+          livenessProbe:
+            httpGet: {path: /health/live, port: http}
+            periodSeconds: 10
+          startupProbe:
+            httpGet: {path: /health/live, port: http}
+            failureThreshold: 60
+            periodSeconds: 2
+          lifecycle:
+            preStop:
+              exec: {command: [/app/bin/lixi, rpc, 'Lixi.Lifecycle.drain()']}
+          volumeMounts:
+            - {name: state, mountPath: /var/lib/lixi}
+  volumeClaimTemplates:
+    - metadata: {name: state}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}
+---
+# Restrict distribution to this application. Add an ingress-controller selector before
+# exposing HTTP beyond this namespace. Egress remains available for Discord and sources.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lixi-ingress
+spec:
+  podSelector:
+    matchLabels: {app: lixi}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: lixi}
+      ports:
+        - {protocol: TCP, port: 4369}
+        - {protocol: TCP, port: 9100}
+    - from:
+        - podSelector: {}
+      ports:
+        - {protocol: TCP, port: 2333}
