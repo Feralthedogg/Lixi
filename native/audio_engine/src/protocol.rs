@@ -29,10 +29,12 @@ impl Wire {
             .output
             .lock()
             .map_err(|_| io::Error::other("stdout lock poisoned"))?;
-        output.write_all(&((payload.len() + HEADER) as u32).to_be_bytes())?;
-        output.write_all(&[1, kind, 0, 0])?;
-        output.write_all(&self.context[..32])?;
-        output.write_all(&request.to_be_bytes())?;
+        let mut header = [0; HEADER + 4];
+        header[..4].copy_from_slice(&((payload.len() + HEADER) as u32).to_be_bytes());
+        header[4..8].copy_from_slice(&[1, kind, 0, 0]);
+        header[8..40].copy_from_slice(&self.context[..32]);
+        header[40..48].copy_from_slice(&request.to_be_bytes());
+        output.write_all(&header)?;
         output.write_all(payload)?;
         output.flush()
     }

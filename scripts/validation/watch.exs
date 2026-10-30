@@ -65,6 +65,11 @@ defmodule Lixi.Validation.Watch do
       watch.connected and not watch.awaiting and watch.progress > 0 and
         watch.recovered == watch.reconnects and watch.stalled == 0
 
+  def assessment(watch, elapsed_ms, required_ms, exceptions) do
+    complete = elapsed_ms >= required_ms
+    %{completedWindow: complete, passed: complete and passed?(watch) and exceptions == 0}
+  end
+
   def summary(watch),
     do:
       Map.take(watch, [

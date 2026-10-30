@@ -1,7 +1,14 @@
 defmodule Lixi.TestVoice do
   use GenServer
   def start(owner, _user, _guild, _voice), do: GenServer.start(__MODULE__, owner)
-  def send_frame(pid, frame, epoch, _due), do: GenServer.call(pid, {:frame, frame, epoch})
+
+  def send_frame(pid, frame, epoch, due) do
+    if observer = Application.get_env(:lixi, :test_voice_observer),
+      do: send(observer, {:frame_dispatch, frame.position, due})
+
+    GenServer.call(pid, {:frame, frame, epoch})
+  end
+
   def fence(pid, epoch), do: GenServer.call(pid, {:fence, epoch})
   def resume(pid), do: GenServer.call(pid, :resume)
   def quiesce(pid), do: GenServer.call(pid, :quiesce)

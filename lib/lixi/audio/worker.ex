@@ -217,7 +217,8 @@ defmodule Lixi.Audio.Worker do
   defp packet(_, _, _, state), do: fail(state, :protocol_violation)
 
   defp command(state, type, request, payload, attempts \\ 0) do
-    bytes = <<1, type, 0::16, state.context::binary, request::64, payload::binary>>
+    header = <<1, type, 0::16, state.context::binary, request::64>>
+    bytes = if type == 4, do: [header, payload], else: <<header::binary, payload::binary>>
 
     cond do
       attempts >= 20 or map_size(state.pending) >= 4 ->

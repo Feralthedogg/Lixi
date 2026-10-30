@@ -1,5 +1,6 @@
 mod dsp;
 mod opus_decoder;
+mod pcm;
 mod protocol;
 mod source;
 mod timescale;
@@ -15,7 +16,6 @@ use std::sync::{
     mpsc, Arc, Condvar, Mutex,
 };
 use symphonia::core::{
-    audio::SampleBuffer,
     codecs::{Decoder, DecoderOptions, CODEC_TYPE_OPUS},
     errors::Error,
     formats::{FormatOptions, SeekMode, SeekTo},
@@ -48,6 +48,27 @@ struct Control {
     gain: f32,
 }
 type Shared = Arc<(Mutex<Control>, Condvar)>;
+
+struct RateConverter {
+    engine: FftFixedInOut<f32>,
+    input: Vec<Vec<f32>>,
+    output: Vec<Vec<f32>>,
+    delay: usize,
+}
+impl RateConverter {
+    fn new(rate: u32) -> Result<Self, rubato::ResamplerConstructionError> {
+        let engine = FftFixedInOut::<f32>::new(rate as usize, 48_000, 1024, 2)?;
+        let input = engine.input_buffer_allocate(true);
+        let output = engine.output_buffer_allocate(true);
+        let delay = engine.output_delay();
+        Ok(Self {
+            engine,
+            input,
+            output,
+            delay,
+        })
+    }
+}
 
 fn run(
     open: Open,
@@ -144,13 +165,13 @@ fn run(
     let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio)?;
     encoder.set_bitrate(opus::Bitrate::Bits(96_000))?;
     let mut resampler = if rate != 48_000 {
-        Some(FftFixedInOut::<f32>::new(rate as usize, 48_000, 1024, 2)?)
+        Some(RateConverter::new(rate)?)
     } else {
         None
     };
-    let mut delay = resampler.as_ref().map_or(0, Resampler::output_delay);
+    let mut decoded = pcm::StereoInput::new(rate, channels);
     let mut input: [VecDeque<f32>; 2] = [VecDeque::new(), VecDeque::new()];
-    let mut output: VecDeque<[f32; 2]> = VecDeque::new();
+    let mut output: VecDeque<[f32; 2]> = VecDeque::with_capacity(1920);
     let mut eof = false;
     let mut emitted_samples = 0_u64;
     let end_ms = open.end_time.map_or(length_ms, |end| {
@@ -196,16 +217,14 @@ fn run(
             match format.next_packet() {
                 Ok(packet) if packet.track_id() == track_id => {
                     let audio = decoder.decode(&packet)?;
-                    let mut samples =
-                        SampleBuffer::<f32>::new(audio.capacity() as u64, *audio.spec());
-                    samples.copy_interleaved_ref(audio);
-                    for frame in samples.samples().chunks_exact(channels) {
-                        if skip_samples > 0 {
-                            skip_samples -= 1;
-                            continue;
+                    let frames = decoded.frames(audio, &mut skip_samples)?;
+                    if resampler.is_none() {
+                        timescale.feed(frames, &mut output)?;
+                    } else {
+                        for frame in frames {
+                            input[0].push_back(frame[0]);
+                            input[1].push_back(frame[1]);
                         }
-                        input[0].push_back(frame[0]);
-                        input[1].push_back(frame[channels - 1]);
                     }
                 }
                 Ok(_) => continue,
@@ -215,47 +234,53 @@ fn run(
                 Err(err) => return Err(err.into()),
             }
             if let Some(resampler) = &mut resampler {
-                let needed = resampler.input_frames_next();
+                let needed = resampler.engine.input_frames_next();
                 while input[0].len() >= needed || (eof && !input[0].is_empty()) {
-                    let mut block = [Vec::with_capacity(needed), Vec::with_capacity(needed)];
-                    for channel in 0..2 {
-                        for _ in 0..needed {
-                            block[channel].push(input[channel].pop_front().unwrap_or(0.));
+                    for (channel, block) in resampler.input.iter_mut().enumerate() {
+                        for sample in &mut block[..needed] {
+                            *sample = input[channel].pop_front().unwrap_or(0.);
                         }
                     }
-                    let converted = resampler.process(&block, None)?;
-                    let frames =
-                        converted[0]
-                            .iter()
-                            .zip(&converted[1])
-                            .filter_map(|(&left, &right)| {
-                                if delay > 0 {
-                                    delay -= 1;
-                                    None
-                                } else {
-                                    Some([left, right])
-                                }
-                            });
+                    let (_, written) = resampler.engine.process_into_buffer(
+                        &resampler.input,
+                        &mut resampler.output,
+                        None,
+                    )?;
+                    let delay = &mut resampler.delay;
+                    let converted = &resampler.output;
+                    let frames = converted[0][..written]
+                        .iter()
+                        .zip(&converted[1][..written])
+                        .filter_map(|(&left, &right)| {
+                            if *delay > 0 {
+                                *delay -= 1;
+                                None
+                            } else {
+                                Some([left, right])
+                            }
+                        });
                     timescale.feed(frames, &mut output)?;
                 }
                 if eof
                     && expected_samples.is_some_and(|n| emitted_samples + (output.len() as u64) < n)
                 {
-                    let converted = resampler.process_partial::<Vec<f32>>(None, None)?;
+                    for block in &mut resampler.input {
+                        block.fill(0.);
+                    }
+                    let (_, written) = resampler.engine.process_into_buffer(
+                        &resampler.input,
+                        &mut resampler.output,
+                        None,
+                    )?;
+                    let converted = &resampler.output;
                     timescale.feed(
-                        converted[0]
+                        converted[0][..written]
                             .iter()
-                            .zip(&converted[1])
+                            .zip(&converted[1][..written])
                             .map(|(&left, &right)| [left, right]),
                         &mut output,
                     )?;
                 }
-            } else {
-                let [left, right] = &mut input;
-                timescale.feed(
-                    left.drain(..).zip(right.drain(..)).map(|(l, r)| [l, r]),
-                    &mut output,
-                )?;
             }
             if eof {
                 timescale.flush(&mut output)?;
@@ -275,17 +300,15 @@ fn run(
             dsp.process(&mut sample, gain);
             frame.copy_from_slice(&sample);
         }
-        let mut opus = [0; 1024];
-        let bytes = encoder.encode_float(&pcm, &mut opus)?;
+        let mut payload = [0; 1034];
+        let bytes = encoder.encode_float(&pcm, &mut payload[10..])?;
         emitted_samples += valid as u64;
         let position = (open.position
             + (emitted_samples as f64 * timescale.speed / 48.).round() as u64)
             .min(if end_ms > 0 { end_ms } else { u64::MAX });
-        let mut payload = Vec::with_capacity(10 + bytes);
-        payload.extend_from_slice(&position.to_be_bytes());
-        payload.extend_from_slice(&(valid as u16).to_be_bytes());
-        payload.extend_from_slice(&opus[..bytes]);
-        wire.send(5, 0, &payload)?;
+        payload[..8].copy_from_slice(&position.to_be_bytes());
+        payload[8..10].copy_from_slice(&(valid as u16).to_be_bytes());
+        wire.send(5, 0, &payload[..10 + bytes])?;
         control
             .0
             .lock()
@@ -346,9 +369,7 @@ fn main_result() -> Result<(), Box<dyn std::error::Error>> {
         match packet[1] {
             4 => {
                 let request = u64::from_be_bytes(packet[36..44].try_into()?);
-                if packet.len() > 65_536 + 44
-                    || responses.send((request, packet[44..].to_vec())).is_err()
-                {
+                if packet.len() > 65_536 + 44 || responses.send((request, packet)).is_err() {
                     break;
                 }
             }

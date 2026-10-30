@@ -2,6 +2,34 @@ defmodule Lixi.PlayerTest do
   use ExUnit.Case, async: false
   import Lixi.TestHelpers
 
+  test "timer jitter does not consume the Voice sender's frame budget" do
+    file = fixture(48_000, 2000)
+    id = session()
+    {:ok, player} = Lixi.Sessions.player(id, "dispatch-budget", true)
+
+    on_exit(fn ->
+      Application.delete_env(:lixi, :test_voice_observer)
+      Lixi.Sessions.destroy(id, "dispatch-budget")
+    end)
+
+    {:ok, patch} = Lixi.Player.validate(%{"track" => %{"identifier" => file}, "voice" => voice()})
+    {:ok, _} = Lixi.Player.update(player, patch, false)
+    eventually(fn -> :sys.get_state(player).position >= 60 end)
+    :ok = :sys.suspend(player)
+    state = :sys.get_state(player)
+    if state.timer, do: Process.cancel_timer(state.timer)
+    {{:value, frame}, _} = :queue.out(state.queue)
+    token = make_ref()
+    :sys.replace_state(player, &%{&1 | timer: nil, token: token})
+    Application.put_env(:lixi, :test_voice_observer, self())
+    due = System.monotonic_time(:microsecond) - 15_000
+    send(player, {:tick, state.epoch, token, due})
+    :ok = :sys.resume(player)
+    position = frame.position
+    assert_receive {:frame_dispatch, ^position, dispatched}, 1000
+    assert dispatched >= due + 10_000
+  end
+
   test "actual audio pauses, seeks and resumes without replacing the Voice session" do
     id = session()
     track = fixture(48_000, 2000) |> track()

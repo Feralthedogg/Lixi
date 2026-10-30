@@ -508,7 +508,7 @@ defmodule Lixi.Player do
   def handle_info({:voice, _, _}, state), do: {:noreply, state}
 
   def handle_info({:tick, epoch, token, due}, %{epoch: epoch, token: token} = state),
-    do: {:noreply, tick(state, due)}
+    do: {:noreply, tick(%{state | timer: nil, token: nil}, due)}
 
   def handle_info({:tick, _, _, _}, state), do: {:noreply, state}
 
@@ -574,9 +574,11 @@ defmodule Lixi.Player do
     if now - due >= 20_000, do: Lixi.Metrics.record(:late, div(now - due, 20_000))
     due = if now - due >= 20_000, do: now, else: due
 
+    # Keep the clock anchor for the next tick; give transport a full frame
+    # budget from dispatch instead of spending it on timer wakeup jitter.
     result =
       if state.speaking,
-        do: state.adapter.send_frame(state.connection, frame, state.epoch, due),
+        do: state.adapter.send_frame(state.connection, frame, state.epoch, now),
         else: {:error, :not_ready}
 
     case result do
@@ -748,6 +750,8 @@ defmodule Lixi.Player do
 
     state
   end
+
+  defp cancel_tick(%{timer: nil, token: nil} = state), do: state
 
   defp cancel_tick(state) do
     if state.timer, do: Process.cancel_timer(state.timer)

@@ -52,19 +52,22 @@ impl Read for Source {
         request[..8].copy_from_slice(&self.position.to_be_bytes());
         request[8..].copy_from_slice(&(length as u32).to_be_bytes());
         self.wire.send(3, self.next_read, &request)?;
-        let (id, bytes) = self
+        let (id, packet) = self
             .responses
             .get_mut()
             .map_err(|_| io::Error::other("source lock poisoned"))?
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "source read timed out"))?;
+        let bytes = packet
+            .get(crate::protocol::HEADER..)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short source response"))?;
         if id != self.next_read || bytes.len() > length || bytes.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid source response",
             ));
         }
-        buffer[..bytes.len()].copy_from_slice(&bytes);
+        buffer[..bytes.len()].copy_from_slice(bytes);
         self.position += bytes.len() as u64;
         self.wire.send(8, id, &[])?;
         Ok(bytes.len())

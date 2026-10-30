@@ -81,7 +81,12 @@ defmodule Lixi.Validation.Soak do
   defp soak(config, bot, private, repeat) do
     Process.register(self(), :lixi_validation)
     owner = self()
-    System.trap_signal(:sigterm, fn -> send(owner, :validation_stop) end)
+
+    System.trap_signal(:sigterm, fn ->
+      send(owner, :validation_stop)
+      :ok
+    end)
+
     origin = config["LIXI_URL"] || "http://127.0.0.1:2333"
     password = Map.fetch!(config, "LIXI_PASSWORD")
     headers = [{"Authorization", password}, {"User-Id", bot}, {"Client-Name", "lixi-soak/1.0"}]
@@ -207,7 +212,14 @@ defmodule Lixi.Validation.Soak do
           :daveCoverage,
           "Protocol counters are observed; participant churn and remote audibility need independent verification"
         )
-        |> Map.put(:passed, Watch.passed?(result.watch) and result.exceptions == 0)
+        |> Map.merge(
+          Watch.assessment(
+            result.watch,
+            System.monotonic_time(:millisecond) - (result.first_frame || started),
+            result.duration_ms,
+            result.exceptions
+          )
+        )
 
       write_report(private, report)
     rescue

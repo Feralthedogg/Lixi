@@ -162,6 +162,18 @@ MIX_ENV=test mix run --no-start scripts/validation/load.exs
 decoding and Player clocks with simulated Voice transport. `LOAD_REPORT` saves
 JSON. It does not measure Discord, DAVE, or cross-host throughput.
 
+The native path borrows valid float planes, reuses conversion/resampler buffers,
+and moves READ_AT responses without an intermediate payload copy. Gain and DSP
+still run at output-credit time. Optional stage benchmarks verify checksums;
+they do not represent end-to-end Discord speedups.
+
+```sh
+cargo test --release --locked --manifest-path native/audio_engine/Cargo.toml benchmark_pcm_conversion -- --ignored --nocapture
+elixir scripts/validation/bench_protocol.exs
+MIX_ENV=test mix run --no-start scripts/validation/compare_native.exs /path/to/baseline /path/to/candidate
+```
+
+
 The [external EDA client](../scripts/validation/discord_soak.exs) runs in a
 separate VM and forwards Gateway Voice updates through the v4 API. A private
 `.env` supplies `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID`,
@@ -175,7 +187,7 @@ elixir -pa "_build/dev/lib/*/ebin" scripts/validation/discord_soak.exs /path/to/
 
 The bounded soak lasts 1,800 seconds and rejoins Voice every 300 seconds.
 `--check` verifies the bot and target without joining Voice; `--loop` repeats
-until stopped and writes a checkpoint every1,800 seconds without ending playback.
+until stopped and writes a checkpoint every 1,800 seconds without ending playback.
 `--shuffle` or `SHUFFLE_PLAYLIST=true` shuffles each complete round, retaining
 every entry and avoiding the same track across round boundaries where possible.
 Continuous playback does not intentionally rejoin Voice; add `--reconnect-test`

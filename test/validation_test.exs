@@ -20,6 +20,18 @@ defmodule Lixi.ValidationTest do
     assert Watch.summary(watch).recovered == 1
   end
 
+  test "stopping a healthy run early cannot pass the required duration" do
+    watch = Watch.new(0) |> Watch.delivered()
+
+    assert %{completedWindow: false, passed: false} =
+             Watch.assessment(watch, 60_000, 1_800_000, 0)
+
+    assert %{completedWindow: true, passed: true} =
+             Watch.assessment(watch, 1_800_000, 1_800_000, 0)
+
+    assert %{passed: false} = Watch.assessment(watch, 1_800_000, 1_800_000, 1)
+  end
+
   test "media acquisition does not hide loss of connectivity or mark an idle gap stalled" do
     watch = Watch.new(0) |> Watch.delivered()
     watch = Watch.sample(watch, true, 100, 1000, false)

@@ -127,6 +127,15 @@ jobs:
             --all-targets 2>&1 | tee test/tmp/ci-logs/native-tests.log
           mix lixi.native
 
+      - name: Exercise optimized stage benchmarks
+        if: matrix.os == 'ubuntu-24.04' && matrix.rust == '1.95.0'
+        run: |
+          cargo test --release --locked --manifest-path native/audio_engine/Cargo.toml \
+            benchmark_pcm_conversion -- --ignored --nocapture \
+            2>&1 | tee test/tmp/ci-logs/pcm-benchmark.log
+          elixir scripts/validation/bench_protocol.exs \
+            2>&1 | tee test/tmp/ci-logs/protocol-benchmark.log
+
       - name: Check Elixir formatting and compilation
         run: |
           mix format --check-formatted
