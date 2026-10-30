@@ -84,6 +84,127 @@ defmodule Lixi.AudioTest do
     Lixi.Audio.Worker.stop(worker)
   end
 
+  test "WebM/Opus trims codec delay and final padding for mono and stereo" do
+    wav = fixture(48_000, 210)
+
+    for channels <- [1, 2] do
+      webm = Path.rootname(wav) <> "-#{channels}.webm"
+
+      assert {_, 0} =
+               System.cmd(
+                 "ffmpeg",
+                 ["-v", "error", "-i", wav, "-ac", to_string(channels), "-c:a", "libopus", webm],
+                 stderr_to_stdout: true
+               )
+
+      assert {:ok, track} = Lixi.Sources.resolve(webm)
+      assert track["info"]["length"] == 210
+      assert {:ok, worker} = Lixi.Audio.Worker.start(self(), webm, 4)
+
+      assert_receive {:audio, ^worker, 4,
+                      {:ready, %{"sampleRate" => 48_000, "channels" => ^channels}}},
+                     2000
+
+      frames = decode_frames(worker, 4)
+      assert Enum.sum(Enum.map(frames, & &1.valid_samples)) == 10_080
+      assert List.last(frames).position == 210
+      Lixi.Audio.Worker.stop(worker)
+    end
+  end
+
+  test "WebM selects audio behind a video track and supports seek and DSP" do
+    wav = fixture(48_000, 1000)
+    webm = Path.rootname(wav) <> "-video.webm"
+
+    assert {_, 0} =
+             System.cmd(
+               "ffmpeg",
+               [
+                 "-v",
+                 "error",
+                 "-f",
+                 "lavfi",
+                 "-i",
+                 "color=c=black:s=16x16:r=1:d=1",
+                 "-i",
+                 wav,
+                 "-c:v",
+                 "libvpx-vp9",
+                 "-c:a",
+                 "libopus",
+                 webm
+               ],
+               stderr_to_stdout: true
+             )
+
+    assert {:ok, track} = Lixi.Sources.resolve(webm)
+    assert track["info"]["length"] == 1000
+
+    for position <- [0, 1, 400, 999] do
+      assert {:ok, worker} =
+               Lixi.Audio.Worker.start(self(), webm, 5,
+                 position: position,
+                 gain: 0.5,
+                 filters: %{"timescale" => %{"speed" => 2.0}}
+               )
+
+      assert_receive {:audio, ^worker, 5, {:ready, _}}, 2000
+      frames = decode_frames(worker, 5)
+      assert Enum.sum(Enum.map(frames, & &1.valid_samples)) == (1000 - position) * 24
+      assert List.last(frames).position == 1000
+      Lixi.Audio.Worker.stop(worker)
+    end
+  end
+
+  test "WebM preserves a single sample beyond a millisecond boundary" do
+    wav = fixture(48_000, 220)
+    webm = Path.rootname(wav) <> "-partial.webm"
+
+    assert {_, 0} =
+             System.cmd(
+               "ffmpeg",
+               [
+                 "-v",
+                 "error",
+                 "-i",
+                 wav,
+                 "-af",
+                 "atrim=end_sample=10081",
+                 "-c:a",
+                 "libopus",
+                 webm
+               ],
+               stderr_to_stdout: true
+             )
+
+    assert {:ok, worker} = Lixi.Audio.Worker.start(self(), webm, 6, position: 210)
+    assert_receive {:audio, ^worker, 6, {:ready, %{"length" => 211}}}, 2000
+    assert [%{valid_samples: 1}] = decode_frames(worker, 6)
+    Lixi.Audio.Worker.stop(worker)
+  end
+
+  defp decode_frames(worker, epoch) do
+    Lixi.Audio.Worker.grant(worker, 25)
+    decode_frames(worker, epoch, 0, [])
+  end
+
+  defp decode_frames(worker, epoch, received, acc) do
+    receive do
+      {:audio, ^worker, ^epoch, {:frame, frame}} ->
+        received = received + 1
+        if rem(received, 10) == 0, do: Lixi.Audio.Worker.grant(worker, received + 25)
+        decode_frames(worker, epoch, received, [frame | acc])
+
+      {:audio, ^worker, ^epoch, :end} ->
+        Enum.reverse(acc)
+
+      {:audio, ^worker, ^epoch, {:error, reason}} ->
+        flunk(inspect(reason))
+    after
+      3000 -> flunk("WebM worker did not reach EOF")
+    end
+  end
+
   defp collect(worker, acc) do
     receive do
       {:audio, ^worker, 1, {:frame, frame}} -> collect(worker, [frame | acc])

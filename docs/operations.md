@@ -10,6 +10,7 @@ All `/v4/lixi/*` routes require `Authorization: <LIXI_PASSWORD>` and
 | --- | --- | --- |
 | GET | `/status` | Local counters, stop predicate, version, and upgrade recovery state |
 | GET | `/instances` | Node status, capacity, versions, and plugins |
+| GET | `/metrics` | Recent CPU, native RSS, playback/probe capacity, and frame counters |
 | POST | `/drain`, `/resume` | Stop or resume new session/Player admission |
 | POST | `/sessions/{id}/move` | Transfer a controller to `target` |
 | GET | `/plugins` | Active/installed versions and recovery state |
@@ -122,7 +123,8 @@ uses three voters and additional workers outside the voter list. Each node
 needs a stable identity, separate persistent data, matching media paths or
 allowlists, and compatible code. Install matching plugins on intended providers.
 
-New Players use accepting capacity. Existing Voice resources are not
+New Players use accepting Player and playback capacity; allocation reserves a
+playback slot before creating a Player. Metadata probes have a separate budget. Existing Voice resources are not
 rebalanced. Any HTTP frontend can route control or resume to the owner;
 `/v4/stats` remains local.
 
@@ -134,6 +136,51 @@ reuse checks. Unconfirmed remote DELETE retains the Player record.
 Stable node names are needed to confirm old PIDs after reconnection. Replacing
 a lost node under a new name does not reclaim uncertain ownership. Dynamic voter
 membership and automatic whole-VM session/media failover are unsupported.
+
+## Metrics and validation
+
+`/v4/stats` includes sampled Rust RSS in memory usage and computes application
+CPU from successive BEAM/native process samples. RSS sums include shared pages
+in each process. `reservable` equals observed allocation; it is not a heap limit.
+Short-lived probes can fall between samples. `/v4/lixi/metrics` exposes sample
+coverage, interval, memory components, capacity, and cumulative counters.
+
+WebSocket `frameStats` reports a rolling minute of sent/nulled frames and deficit
+against active playback time. The REST field remains null for Lavalink
+compatibility. Admin counters also include late frame intervals, underruns,
+send failures, Voice reconnects, and observed DAVE prepare/ready events.
+`nulled` stays zero because the Player does not synthesize null media frames.
+On macOS, `systemLoad` is normalized one-minute load average; admin metrics name
+that basis. Application CPU uses recent process CPU deltas on both platforms.
+
+```sh
+MIX_ENV=test mix run --no-start scripts/validation/load.exs
+```
+
+`LOAD_STREAMS` defaults to ten and `LOAD_SECONDS` to 30. This measures real native
+decoding and Player clocks with simulated Voice transport. `LOAD_REPORT` saves
+JSON. It does not measure Discord, DAVE, or cross-host throughput.
+
+The [external EDA client](../scripts/validation/discord_soak.exs) runs in a
+separate VM and forwards Gateway Voice updates through the v4 API. A private
+`.env` supplies `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID`,
+`LIXI_URL`, `LIXI_PASSWORD`, `LIXI_ADMIN_TOKEN`, and `PLAYLIST_FILE` (a JSON array of
+supported identifiers). Keep bot credentials outside the server and repository.
+
+```sh
+elixir -pa "_build/dev/lib/*/ebin" scripts/validation/discord_soak.exs /path/to/private/.env --check
+elixir -pa "_build/dev/lib/*/ebin" scripts/validation/discord_soak.exs /path/to/private/.env
+```
+
+The default soak lasts 1,800 seconds and rejoins Voice every 300 seconds.
+`--check` verifies the bot and target without joining Voice; `--loop` repeats
+until stopped. Tracks advance on TrackEnd and wrap at the end of the list.
+`YOUTUBE_PLAYLIST_URL` optionally selects a public playlist using `tools/yt-dlp`
+beside the private `.env`. The client fetches one Opus/WebM file at a time, with
+a 32 MiB / 120-second per-track bound, and removes its own temporary media.
+Downloads can introduce gaps between tracks. Reports stay beside the private
+configuration. Peer DAVE transitions require participant changes; solo playback
+and successful UDP sends do not verify remote audibility.
 
 ## Deployment
 

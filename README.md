@@ -23,7 +23,7 @@ information through the Lavalink API and does not require a bot token.
 ## Features
 
 - Lavalink v4 REST, WebSocket events, track encoding, and session resume.
-- WAV PCM and MP3 playback from allowed local files or finite HTTP resources.
+- WAV PCM, MP3, and WebM/Opus playback from allowed local files or finite HTTP resources.
 - Volume, equalizer, karaoke, timescale, tremolo, vibrato, rotation, distortion,
   channelMix, and lowPass filters.
 - Isolated Rust audio workers with bounded input reads and output credits.
@@ -150,10 +150,13 @@ release startup with plugin restoration.
 
 ## Limits
 
-- Built-in sources support finite WAV PCM and MP3 resources. HTTP sources
+- Built-in sources support finite WAV PCM, MP3, and mono/stereo WebM/Opus.
+  WebM probing and seeking scan the source; the 10-second open deadline applies.
+  Timestamp discontinuities and multichannel Opus mappings are unsupported. HTTP sources
   require a strong ETag and correct byte-range responses.
 - YouTube/SoundCloud search, Java JAR plugins, and an active RoutePlanner are
-  not included. `frameStats` is currently `null`.
+  not included. The external validation client can acquire a public YouTube
+  playlist with yt-dlp and repeat its tracks.
 - Raft does not replicate audio, Voice secrets, DAVE resources, or durable copies
   of every session. Network uncertainty does not trigger a second Voice sender.
 - macOS arm64 is locally verified. Live Discord channel transmission,

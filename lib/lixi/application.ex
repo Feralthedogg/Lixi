@@ -25,6 +25,7 @@ defmodule Lixi.Application do
        name: Lixi.PlayerSupervisor,
        max_children: Application.fetch_env!(:lixi, :max_players)},
       Lixi.Admission,
+      Lixi.Metrics,
       Lixi.Sessions,
       Lixi.Upgrade,
       Lixi.Cluster.Member
@@ -43,6 +44,6 @@ defmodule Lixi.Application do
         children
       end
 
-    Supervisor.start_link(children, strategy: :one_for_one, name: Lixi.Supervisor)
+    Lixi.Supervisor.start_link(children)
   end
 end

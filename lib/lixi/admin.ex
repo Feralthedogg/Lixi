@@ -19,6 +19,8 @@ defmodule Lixi.Admin do
 
   get("/status", do: reply(conn, 200, Map.merge(Lixi.Lifecycle.status(), Lixi.Upgrade.status())))
 
+  get("/metrics", do: reply(conn, 200, Lixi.Metrics.snapshot()))
+
   get "/instances" do
     case Lixi.Cluster.instances() do
       {:ok, instances} ->
@@ -31,6 +33,7 @@ defmodule Lixi.Admin do
               version: info.version,
               players: info.players,
               maxPlayers: info.max_players,
+              workers: Map.delete(Map.get(info, :workers, %{}), :os_pids),
               plugins: Enum.map(Map.get(info, :plugins, []), &Map.take(&1, [:name, :version]))
             }
           end)

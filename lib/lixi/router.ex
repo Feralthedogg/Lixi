@@ -217,7 +217,12 @@ defmodule Lixi.Router do
 
       :continue ->
         with {:ok, patch} <- Lixi.Player.resolve_patch(patch),
-             {:ok, pid} <- Lixi.Sessions.player(session, guild, true),
+             {:ok, pid} <-
+               Lixi.Sessions.player(
+                 session,
+                 guild,
+                 if(match?({:play, _}, patch.track), do: :playback, else: true)
+               ),
              do: Lixi.Player.update(pid, patch, no_replace)
     end
   end

@@ -57,7 +57,7 @@ defmodule Lixi.Sources do
     if String.starts_with?(identifier, ["ytsearch:", "ytmsearch:", "scsearch:"]) do
       {:error, :unsupported_source}
     else
-      case Lixi.Audio.Worker.start(self(), identifier, 0) do
+      case Lixi.Audio.Worker.start(self(), identifier, 0, purpose: :probe) do
         {:ok, worker} ->
           try do
             receive do

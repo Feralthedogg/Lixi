@@ -29,7 +29,7 @@ defmodule Lixi.WebSocket do
 
   def handle_info(:stats, state) do
     Process.send_after(self(), :stats, 60_000)
-    {:push, {:text, Jason.encode!(Map.put(Lixi.Info.stats(), "op", "stats"))}, state}
+    {:push, {:text, Jason.encode!(Map.put(Lixi.Info.stats(:websocket), "op", "stats"))}, state}
   end
 
   def handle_info({:DOWN, ref, _, _, _}, %{monitor: ref} = state),

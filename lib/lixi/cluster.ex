@@ -31,16 +31,18 @@ defmodule Lixi.Cluster do
     end
   end
 
-  def candidates(key) do
+  def candidates(key, purpose \\ :idle) do
     with {:ok, instances} <- instances() do
       nodes =
         instances
         |> Enum.filter(fn {instance, info} ->
           instance == node(info.pid) and info.status == :accepting and
-            info.players < info.max_players
+            info.players < info.max_players and
+            (purpose != :playback or worker_ratio(info) < 1)
         end)
         |> Enum.sort_by(fn {instance, info} ->
-          {info.players / max(info.max_players, 1), -:erlang.phash2({key, instance})}
+          {max(info.players / max(info.max_players, 1), worker_ratio(info)),
+           -:erlang.phash2({key, instance})}
         end)
         |> Enum.map(&elem(&1, 0))
 
@@ -64,18 +66,18 @@ defmodule Lixi.Cluster do
     :exit, _ -> {:error, :unavailable}
   end
 
-  def start_player(session, user, guild, owner) do
+  def start_player(session, user, guild, owner, purpose \\ :idle) do
     case lookup({:player, session, guild}) do
       {:ok, pid} -> {:ok, pid}
-      {:error, :not_found} -> allocate_player(session, user, guild, owner)
+      {:error, :not_found} -> allocate_player(session, user, guild, owner, purpose)
       error -> error
     end
   end
 
-  defp allocate_player(session, user, guild, owner) do
-    with {:ok, instances} <- candidates({session, guild}) do
+  defp allocate_player(session, user, guild, owner, purpose) do
+    with {:ok, instances} <- candidates({session, guild}, purpose) do
       Enum.reduce_while(instances, {:error, :capacity}, fn instance, _ ->
-        case rpc(instance, __MODULE__, :start_player_local, [session, user, guild, owner]) do
+        case rpc(instance, __MODULE__, :start_player_local, [session, user, guild, owner, purpose]) do
           {:ok, _} = result -> {:halt, result}
           error -> {:cont, error}
         end
@@ -83,29 +85,40 @@ defmodule Lixi.Cluster do
     end
   end
 
-  def start_player_local(session, user, guild, owner) do
+  def start_player_local(session, user, guild, owner, purpose \\ :idle) do
     if Lixi.Lifecycle.accepting?() do
-      result =
-        DynamicSupervisor.start_child(
-          Lixi.PlayerSupervisor,
-          {Lixi.Player, session: session, user: user, guild: guild, owner: owner}
-        )
+      permit = if purpose == :playback, do: Lixi.Admission.acquire(), else: {:ok, nil}
 
-      case result do
-        {:error, :already_owned} ->
-          lookup({:player, session, guild})
+      with {:ok, lease} <- permit do
+        result =
+          DynamicSupervisor.start_child(
+            Lixi.PlayerSupervisor,
+            {Lixi.Player,
+             session: session, user: user, guild: guild, owner: owner, worker_lease: lease}
+          )
 
-        {:ok, _} ->
-          if pid = Process.whereis(Lixi.Cluster.Member), do: send(pid, :heartbeat)
-          result
+        case result do
+          {:ok, _} ->
+            if pid = Process.whereis(Lixi.Cluster.Member), do: send(pid, :heartbeat)
+            result
 
-        _ ->
-          result
+          error ->
+            Lixi.Admission.release(lease)
+
+            if error == {:error, :already_owned},
+              do: lookup({:player, session, guild}),
+              else: error
+        end
       end
     else
       {:error, :draining}
     end
   end
+
+  defp worker_ratio(%{workers: workers}),
+    do: workers.playback / max(workers.max_playback, 1)
+
+  defp worker_ratio(_), do: 1.0
 
   def terminate_player(pid),
     do: rpc(node(pid), __MODULE__, :terminate_player_local, [pid])

@@ -1,4 +1,5 @@
 mod dsp;
+mod opus_decoder;
 mod protocol;
 mod source;
 mod timescale;
@@ -15,7 +16,7 @@ use std::sync::{
 };
 use symphonia::core::{
     audio::SampleBuffer,
-    codecs::DecoderOptions,
+    codecs::{Decoder, DecoderOptions, CODEC_TYPE_OPUS},
     errors::Error,
     formats::{FormatOptions, SeekMode, SeekTo},
     io::MediaSourceStream,
@@ -69,7 +70,13 @@ fn run(
         },
     )?;
     let mut format = probed.format;
-    let track = format.default_track().ok_or("no audio track")?;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|track| {
+            track.codec_params.sample_rate.is_some() && track.codec_params.channels.is_some()
+        })
+        .ok_or("no audio track")?;
     let track_id = track.id;
     let rate = track
         .codec_params
@@ -83,13 +90,32 @@ fn run(
     if !(8_000..=192_000).contains(&rate) || !(1..=2).contains(&channels) {
         return Err("unsupported audio layout".into());
     }
-    let length_ms = track
-        .codec_params
-        .n_frames
-        .map_or(0, |n| n * 1000 / u64::from(rate));
+    let length_ms = if track.codec_params.codec == CODEC_TYPE_OPUS {
+        track.codec_params.n_frames.unwrap_or(0).div_ceil(48)
+    } else {
+        track.codec_params.n_frames.map_or(0, |n| {
+            let time = track
+                .codec_params
+                .time_base
+                .unwrap_or(symphonia::core::units::TimeBase::new(1, rate))
+                .calc_time(n);
+            time.seconds * 1000 + (time.frac * 1000.).round() as u64
+        })
+    };
+    let opus_samples = if track.codec_params.codec == CODEC_TYPE_OPUS {
+        track.codec_params.n_frames
+    } else {
+        None
+    };
     let timebase = track.codec_params.time_base;
-    let mut decoder =
-        symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
+    let mut decoder: Box<dyn Decoder> = if track.codec_params.codec == CODEC_TYPE_OPUS {
+        Box::new(opus_decoder::OpusDecoder::try_new(
+            &track.codec_params,
+            &DecoderOptions::default(),
+        )?)
+    } else {
+        symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?
+    };
     wire.send(
         2,
         0,
@@ -135,7 +161,15 @@ fn run(
         }
     });
     let mut timescale = timescale::Timescale::new(&open.filters);
-    let expected_samples = if end_ms > 0 {
+    let expected_samples = if let Some(total) = opus_samples {
+        let end = open
+            .end_time
+            .map_or(total, |end| total.min(end.saturating_mul(48)));
+        Some(
+            (end.saturating_sub(open.position.saturating_mul(48)) as f64 / timescale.speed).round()
+                as u64,
+        )
+    } else if end_ms > 0 {
         Some((end_ms.saturating_sub(open.position) as f64 * 48. / timescale.speed).round() as u64)
     } else {
         None

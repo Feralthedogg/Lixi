@@ -63,6 +63,64 @@ defmodule Lixi.ClusterTest do
 
   @tag timeout: 90_000
   @tag distributed: true
+  test "stale heartbeats cannot oversubscribe playback; allocation tries another node" do
+    harness = start_supervised!(Lixi.TestCluster)
+    %{peers: peers} = Lixi.TestCluster.info(harness)
+    [{a, an}, {b, _} | _] = peers
+    assert await_ready(peers, System.monotonic_time(:millisecond) + 10_000)
+
+    for {peer, _} <- peers do
+      :peer.call(peer, Application, :put_env, [:lixi, :max_workers, 1])
+      :peer.call(peer, :erlang, :send, [Lixi.Cluster.Member, :heartbeat])
+    end
+
+    eventually(fn ->
+      {:ok, instances} = :peer.call(a, Lixi.Cluster, :instances, [])
+      Enum.all?(instances, fn {_, info} -> info.workers.max_playback == 1 end)
+    end)
+
+    {:ok, socket} = :peer.call(a, Lixi.TestInbox, :start, [])
+    {:ok, id, false, []} = :peer.call(a, Lixi.Sessions, :connect, ["123", socket])
+    {:ok, owner} = :peer.call(a, Lixi.Cluster, :lookup, [{:session, id}])
+
+    guild =
+      Enum.find_value(1..100, fn n ->
+        guild = to_string(n)
+
+        case :peer.call(a, Lixi.Cluster, :candidates, [{id, guild}, :playback]) do
+          {:ok, [^an | _]} -> guild
+          _ -> nil
+        end
+      end)
+
+    assert is_binary(guild)
+    :ok = :peer.call(a, :sys, :suspend, [Lixi.Cluster.Member])
+
+    {:ok, full} =
+      :peer.call(a, Lixi.Cluster, :start_player_local, [id, "123", "full", owner, :playback])
+
+    assert {:ok, ^full} = :peer.call(a, Lixi.Sessions, :player, [id, "full", true])
+    assert {:ok, allocated} = :peer.call(b, Lixi.Sessions, :player, [id, guild, :playback])
+    assert node(allocated) != an
+    assert :peer.call(a, Lixi.Admission, :snapshot, []).playback == 1
+    :ok = :peer.call(a, :sys, :resume, [Lixi.Cluster.Member])
+
+    eventually(fn ->
+      {:ok, instances} = :peer.call(b, Lixi.Cluster, :instances, [])
+      instances[an].workers.playback == 1
+    end)
+
+    {:ok, candidates} =
+      :peer.call(b, Lixi.Cluster, :candidates, [{id, "exclude-full"}, :playback])
+
+    refute an in candidates
+    assert :ok = :peer.call(b, Lixi.Sessions, :destroy, [id, "full"])
+    assert :ok = :peer.call(b, Lixi.Sessions, :destroy, [id, guild])
+    :ok = stop_supervised(Lixi.TestCluster)
+  end
+
+  @tag timeout: 90_000
+  @tag distributed: true
   test "a three-voter quorum and a worker preserve media through session transfer and a partition" do
     harness = start_supervised!(Lixi.TestCluster)
     %{peers: peers, epmd_port: epmd_port} = Lixi.TestCluster.info(harness)

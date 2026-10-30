@@ -32,6 +32,7 @@ defmodule Lixi.Cluster.Member do
       status: mode,
       players: DynamicSupervisor.count_children(Lixi.PlayerSupervisor).active,
       max_players: Application.fetch_env!(:lixi, :max_players),
+      workers: Lixi.Admission.snapshot(),
       plugins: plugins,
       version: Lixi.Upgrade.version()
     }

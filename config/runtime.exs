@@ -32,6 +32,7 @@ if config_env() != :test do
     cluster_timeout: positive.("LIXI_CLUSTER_TIMEOUT", 1_000, 10_000),
     max_players: positive.("LIXI_MAX_PLAYERS", 100, 100_000),
     max_workers: positive.("LIXI_MAX_WORKERS", 10, 100_000),
+    max_probe_workers: positive.("LIXI_MAX_PROBE_WORKERS", 2, 1_000),
     max_sessions: positive.("LIXI_MAX_SESSIONS", 100, 100_000),
     data_dir: data_directory,
     upgrade_root: System.get_env("LIXI_UPGRADE_ROOT", Path.join(data_directory, "upgrades")),

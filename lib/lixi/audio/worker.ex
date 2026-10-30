@@ -3,21 +3,43 @@ defmodule Lixi.Audio.Worker do
   use GenServer
 
   def start(owner, identifier, epoch, options \\ []) do
-    with {:ok, lease} <- Lixi.Admission.acquire() do
-      case GenServer.start(__MODULE__, {owner, identifier, epoch, options}) do
+    permit =
+      case Keyword.get(options, :lease) do
+        nil -> Lixi.Admission.acquire(Keyword.get(options, :purpose, :playback))
+        lease -> {:ok, lease}
+      end
+
+    with {:ok, lease} <- permit do
+      case GenServer.start(__MODULE__, {owner, identifier, epoch, options, lease}) do
         {:ok, pid} ->
-          Lixi.Admission.transfer(lease, pid)
-          {:ok, pid}
+          case if(Keyword.has_key?(options, :lease),
+                 do: :ok,
+                 else: Lixi.Admission.transfer(lease, pid)
+               ) do
+            :ok ->
+              {:ok, pid}
+
+            error ->
+              stop(pid)
+              error
+          end
 
         error ->
-          Lixi.Admission.release(lease)
+          if not Keyword.has_key?(options, :lease), do: Lixi.Admission.release(lease)
           error
       end
     end
   end
 
   def grant(pid, limit), do: GenServer.cast(pid, {:grant, limit})
-  def stop(pid) when is_pid(pid), do: GenServer.cast(pid, :stop)
+
+  def stop(pid) when is_pid(pid) do
+    GenServer.stop(pid, :normal, 8_000)
+  catch
+    :exit, {:noproc, _} -> :ok
+    :exit, {:normal, _} -> :ok
+  end
+
   def stop(_), do: :ok
 
   def executable do
@@ -31,10 +53,11 @@ defmodule Lixi.Audio.Worker do
   end
 
   @impl true
-  def init({owner, identifier, epoch, options}) do
+  def init({owner, identifier, epoch, options, lease}) do
     Process.flag(:trap_exit, true)
 
     with true <- File.regular?(executable()),
+         :ok <- Lixi.Admission.attach(lease, nil),
          {:ok, source} <- Lixi.Source.start_link(identifier) do
       description = Lixi.Source.describe(source)
       expected = Keyword.get(options, :source_version)
@@ -54,7 +77,13 @@ defmodule Lixi.Audio.Worker do
           :use_stdio
         ])
 
+      {:os_pid, os_pid} = Port.info(port, :os_pid)
+      :ok = Lixi.Admission.attach(lease, os_pid)
+
       state = %{
+        lease: lease,
+        managed_lease: Keyword.has_key?(options, :lease),
+        ready_timer: Process.send_after(self(), :open_timeout, 10_000),
         port: port,
         source: source,
         source_version: description.version,
@@ -119,6 +148,8 @@ defmodule Lixi.Audio.Worker do
 
   def handle_info({:DOWN, ref, _, _, _}, %{monitor: ref} = state), do: {:stop, :normal, state}
 
+  def handle_info(:open_timeout, state), do: fail(state, :load_timeout)
+
   def handle_info(:retry, state) do
     pending = state.pending
     state = %{state | pending: %{}}
@@ -136,6 +167,7 @@ defmodule Lixi.Audio.Worker do
   defp packet(2, _, payload, state) do
     case Jason.decode(payload) do
       {:ok, metadata} when is_map(metadata) ->
+        Process.cancel_timer(state.ready_timer)
         notify(state, {:ready, Map.put(metadata, :source_version, state.source_version)})
         {:noreply, state}
 
@@ -217,6 +249,7 @@ defmodule Lixi.Audio.Worker do
   @impl true
   def terminate(_, state) do
     if Port.info(state.port), do: Port.close(state.port)
+    if not state.managed_lease, do: Lixi.Admission.release(state.lease)
     if Process.alive?(state.source), do: GenServer.stop(state.source, :normal, 7_000)
   end
 end

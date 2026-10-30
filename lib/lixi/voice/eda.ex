@@ -267,9 +267,15 @@ defmodule Lixi.Voice.EDA do
     # davey 0.1 mutates sender state during commit preparation. Keep the gate
     # closed until Execute rather than sending with a prepared, uncommitted key.
     if op != 22, do: send(state.owner, {:voice, self(), :buffering})
+    if op == 21, do: Lixi.Metrics.record(:dave_transitions)
     {manager, payloads} = Manager.handle_mls_event(manager, op, data)
     ready = (op == 22 or data["transition_id"] == 0) and Manager.ready?(manager)
-    if ready, do: send(state.owner, {:voice, self(), :ready})
+
+    if ready do
+      Lixi.Metrics.record(:dave_ready)
+      send(state.owner, {:voice, self(), :ready})
+    end
+
     Enum.each(payloads, &send(self(), {:outbound, &1}))
     {:ok, %{state | manager: manager, ready: ready, pending_transition: not ready}}
   end
@@ -465,6 +471,7 @@ defmodule Lixi.Voice.EDA do
       end
 
     if (not fatal and state.retries < 3 and state.transport) && state.transport.key do
+      Lixi.Metrics.record(:voice_reconnects)
       {:reconnect, %{state | ready: false, reconnecting: true, retries: state.retries + 1}}
     else
       send(

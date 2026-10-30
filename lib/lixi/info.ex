@@ -22,11 +22,12 @@ defmodule Lixi.Info do
     }
   end
 
-  def stats do
+  def stats(context \\ :rest) do
     memory = :erlang.memory()
     {uptime, _} = :erlang.statistics(:wall_clock)
-    {cpu_ms, _} = :erlang.statistics(:runtime)
-    cores = System.schedulers_online()
+    metrics = Lixi.Metrics.snapshot()
+    native_rss = metrics.nativeRss
+    cores = metrics.cores
 
     players =
       Registry.select(Lixi.Registry, [{{{:player, :_, :_}, :_, :_}, [], [true]}]) |> length()
@@ -40,16 +41,20 @@ defmodule Lixi.Info do
       "uptime" => uptime,
       "memory" => %{
         "free" => memory[:processes] - memory[:processes_used],
-        "used" => memory[:total] - memory[:processes] + memory[:processes_used],
-        "allocated" => memory[:total],
-        "reservable" => memory[:total]
+        "used" => memory[:total] - memory[:processes] + memory[:processes_used] + native_rss,
+        "allocated" => memory[:total] + native_rss,
+        "reservable" => memory[:total] + native_rss
       },
       "cpu" => %{
         "cores" => cores,
-        "systemLoad" => :cpu_sup.avg1() / 256 / cores,
-        "lavalinkLoad" => cpu_ms / max(uptime, 1) / cores
+        "systemLoad" => metrics.systemLoad,
+        "lavalinkLoad" => metrics.cpu
       },
-      "frameStats" => nil
+      "frameStats" =>
+        if(context == :websocket and players > 0,
+          do: Map.new([:sent, :nulled, :deficit], &{Atom.to_string(&1), metrics.frames[&1]}),
+          else: nil
+        )
     }
   end
 end

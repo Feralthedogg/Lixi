@@ -34,10 +34,17 @@ responses. Redirects and URI user information are unsupported.
 | --- | ---: | ---: |
 | `LIXI_MAX_PLAYERS` | 100 | 1–100,000 |
 | `LIXI_MAX_WORKERS` | 10 | 1–100,000 |
+| `LIXI_MAX_PROBE_WORKERS` | 2 | 1–1,000 |
 | `LIXI_MAX_SESSIONS` | 100 | 1–100,000 |
 | `LIXI_CLUSTER_TIMEOUT` | 1,000 ms | 1–10,000 ms |
 
-Limits are per instance. Native-worker admission includes source probes.
+Limits are per instance. Playback permits and probe workers use independent
+budgets: ten playback slots plus two probe processes by default. A playback
+permit stays with its Player through seek, filter changes and decoder recovery;
+unused allocation reservations expire after 15 seconds. Metadata probes cannot
+consume playback permits. Saturating the probe budget returns `worker_capacity`.
+New playback placement considers both Player and playback-slot utilization and
+reserves a slot atomically on the selected node.
 Configuration maxima are validation bounds, not throughput guarantees.
 
 ## Cluster and storage

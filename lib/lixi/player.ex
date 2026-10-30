@@ -149,6 +149,13 @@ defmodule Lixi.Player do
   defp init_owned(opts) do
     session = Keyword.fetch!(opts, :session)
     guild = Keyword.fetch!(opts, :guild)
+    lease = Keyword.get(opts, :worker_lease)
+
+    if lease do
+      :ok = Lixi.Admission.transfer(lease, self())
+      Process.send_after(self(), :expire_reservation, 15_000)
+    end
+
     Registry.register(Lixi.Registry, {:player, session, guild}, nil)
     Lixi.Cluster.Owners.watch(self(), session)
 
@@ -183,6 +190,7 @@ defmodule Lixi.Player do
        end_time: nil,
        started: false,
        epoch: 0,
+       worker_lease: lease,
        worker: nil,
        worker_monitor: nil,
        source_version: nil,
@@ -376,24 +384,39 @@ defmodule Lixi.Player do
   end
 
   defp open_worker(state, position) do
-    options = [
-      position: position,
-      gain: state.volume / 100,
-      filters: state.filters,
-      source_version: state.source_version,
-      end_time: state.end_time
-    ]
+    permit =
+      case Map.get(state, :worker_lease) do
+        nil -> Lixi.Admission.acquire()
+        lease -> {:ok, lease}
+      end
 
-    case Worker.start(self(), state.track["info"]["identifier"], state.epoch, options) do
-      {:ok, worker} ->
-        %{
-          state
-          | worker: worker,
-            worker_monitor: Process.monitor(worker),
-            received: 0,
-            limit: 0,
-            worker_done: false
-        }
+    case permit do
+      {:ok, lease} ->
+        state = Map.put(state, :worker_lease, lease)
+
+        options = [
+          lease: lease,
+          position: position,
+          gain: state.volume / 100,
+          filters: state.filters,
+          source_version: state.source_version,
+          end_time: state.end_time
+        ]
+
+        case Worker.start(self(), state.track["info"]["identifier"], state.epoch, options) do
+          {:ok, worker} ->
+            %{
+              state
+              | worker: worker,
+                worker_monitor: Process.monitor(worker),
+                received: 0,
+                limit: 0,
+                worker_done: false
+            }
+
+          {:error, reason} ->
+            fail_track(state, reason)
+        end
 
       {:error, reason} ->
         fail_track(state, reason)
@@ -401,6 +424,13 @@ defmodule Lixi.Player do
   end
 
   @impl true
+  def handle_info(:expire_reservation, %{track: nil} = state) do
+    Lixi.Admission.release(Map.get(state, :worker_lease))
+    {:noreply, Map.put(state, :worker_lease, nil)}
+  end
+
+  def handle_info(:expire_reservation, state), do: {:noreply, state}
+
   def handle_info(
         {:audio, worker, epoch, {:ready, metadata}},
         %{worker: worker, epoch: epoch} = state
@@ -530,6 +560,7 @@ defmodule Lixi.Player do
   defp tick(%{ready: false} = state, _), do: schedule(state, 100_000)
 
   defp tick(%{count: 0} = state, _) do
+    if not state.buffering, do: Lixi.Metrics.record(:underruns)
     state |> quiesce() |> Map.put(:buffering, true) |> schedule(100_000)
   end
 
@@ -540,6 +571,7 @@ defmodule Lixi.Player do
     state = ensure_speaking(state)
     {{:value, frame}, queue} = :queue.out(state.queue)
     now = System.monotonic_time(:microsecond)
+    if now - due >= 20_000, do: Lixi.Metrics.record(:late, div(now - due, 20_000))
     due = if now - due >= 20_000, do: now, else: due
 
     result =
@@ -549,11 +581,14 @@ defmodule Lixi.Player do
 
     case result do
       :ok ->
+        Lixi.Metrics.record(:sent)
+
         state =
           if state.started do
             state
           else
             Registry.register(Lixi.Registry, {:playing, state.session, state.guild}, nil)
+            Lixi.Metrics.playing(self(), true)
 
             emit(state, %{
               op: "event",
@@ -582,6 +617,7 @@ defmodule Lixi.Player do
         schedule(state, 100_000)
 
       {:error, _} ->
+        Lixi.Metrics.record(:send_errors)
         %{state | ready: false, connected: false}
     end
   end
@@ -641,8 +677,17 @@ defmodule Lixi.Player do
       reason: reason
     })
 
+    Lixi.Metrics.playing(self(), false)
     Registry.unregister(Lixi.Registry, {:playing, state.session, state.guild})
     state = stop_worker(state) |> cancel_tick()
+
+    state =
+      if reason == "replaced" do
+        state
+      else
+        Lixi.Admission.release(Map.get(state, :worker_lease))
+        Map.put(state, :worker_lease, nil)
+      end
 
     %{
       state
@@ -694,6 +739,8 @@ defmodule Lixi.Player do
   defp sync_playing(state) do
     key = {:playing, state.session, state.guild}
 
+    Lixi.Metrics.playing(self(), state.track != nil and state.started and not state.paused)
+
     if state.track != nil and state.started and not state.paused,
       do: Registry.register(Lixi.Registry, key, nil),
       else: Registry.unregister(Lixi.Registry, key)
@@ -740,6 +787,7 @@ defmodule Lixi.Player do
   @impl true
   def terminate(_, state) do
     Worker.stop(state.worker)
+    Lixi.Admission.release(Map.get(state, :worker_lease))
     if state.connection, do: state.adapter.close(state.connection)
   end
 

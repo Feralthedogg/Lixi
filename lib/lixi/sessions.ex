@@ -304,8 +304,14 @@ defmodule Lixi.Sessions do
   def handle_call({:player, id, guild, create}, _from, state) do
     with %{players: players} = session <- state.sessions[id] do
       case players[guild] do
-        nil when create ->
-          case Lixi.Cluster.start_player(id, session.user, guild, self()) do
+        nil when create in [true, :playback] ->
+          case Lixi.Cluster.start_player(
+                 id,
+                 session.user,
+                 guild,
+                 self(),
+                 if(create == :playback, do: :playback, else: :idle)
+               ) do
             {:ok, pid} ->
               session = monitor_player(session, guild, pid)
               {:reply, {:ok, pid}, put_in(state, [:sessions, id], session)}

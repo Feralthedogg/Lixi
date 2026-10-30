@@ -59,7 +59,10 @@ The media gate stays closed during DAVE prepare/execute transitions.
 | One input read | 64 KiB |
 | Raw frames and production reservations | 25 frames maximum |
 | Raw buffer target | 15 frames |
-| Native workers, including probes | 10 per instance |
+| Playback permits | 10 per instance |
+| Metadata probe workers | Two additional processes per instance |
+| WebM payload/metadata element | 16 MiB |
+| WebM tracks / cues | 32 / 16,384 |
 | Plugin callbacks | Eight concurrent executions; five-second default deadline |
 | Critical event outbox | 4,096 entries / 8 MiB per node |
 | Disconnected-session event buffer | 256 critical events |
