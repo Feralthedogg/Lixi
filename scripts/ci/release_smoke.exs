@@ -174,11 +174,11 @@ defmodule Lixi.CI.ReleaseSmoke do
         do: {url, headers, ~c"application/json", Jason.encode!(body)},
         else: {url, headers}
 
+    http_options = [timeout: 15_000, connect_timeout: 5_000, autoredirect: false]
+    response_options = [body_format: :binary]
+
     {:ok, {{_, status, _}, _, response}} =
-      :httpc.request(
-        method,
-        request,
-        [timeout: 15_000, connect_timeout: 5_000, autoredirect: false], body_format: :binary)
+      :httpc.request(method, request, http_options, response_options)
 
     {status, response}
   end
