@@ -4,6 +4,7 @@
   <img src="./image/lixi_logo.svg" alt="Lixi logo" width="560">
 </p>
 
+[![CI](https://github.com/Feralthedogg/Lixi/actions/workflows/ci.yml/badge.svg)](https://github.com/Feralthedogg/Lixi/actions/workflows/ci.yml)
 ![Elixir](https://img.shields.io/badge/Elixir-1.20-6e4a8e)
 ![OTP](https://img.shields.io/badge/OTP-29-a90533)
 ![Rust](https://img.shields.io/badge/Rust-1.88%2B-b76e4b)
@@ -143,7 +144,9 @@ MIX_ENV=prod mix release
 ```
 
 `mix check` runs formatting, compilation, and application tests. Native checks
-require the build toolchain above.
+require the build toolchain above. [CI](.github/workflows/ci.yml) also checks the
+Rust minimum version, Linux/macOS builds, repeated fault suites, and packaged
+release startup with plugin restoration.
 
 ## Limits
 

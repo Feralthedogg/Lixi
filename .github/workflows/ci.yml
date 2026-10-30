@@ -1,0 +1,195 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+  CARGO_TERM_COLOR: always
+  ERL_FLAGS: '+S 4:4'
+  MIX_ENV: test
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+
+jobs:
+  contracts:
+    name: Workflow and documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Lint workflow expressions and shell commands
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - name: Validate documentation links and examples
+        run: python3 scripts/ci/check_docs.py
+      - name: Check whitespace
+        run: git show --check --format= HEAD
+
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64 / Rust MSRV
+            os: ubuntu-24.04
+            rust: 1.88.0
+          - name: Linux x64 / Rust 1.95
+            os: ubuntu-24.04
+            rust: 1.95.0
+          - name: macOS arm64 / Rust 1.95
+            os: macos-15
+            rust: 1.95.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential cmake pkg-config libclang-dev llvm-dev libssl-dev ffmpeg
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Install macOS build tools
+        if: runner.os == 'macOS'
+        run: |
+          missing=()
+          for formula in cmake pkg-config llvm ffmpeg; do
+            if ! brew list --versions "$formula" > /dev/null; then
+              missing+=("$formula")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            brew install "${missing[@]}"
+          fi
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          otp-version: 29.1.2
+          elixir-version: 1.20.4
+          version-type: strict
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            native/audio_engine/target
+          key: ci-${{ runner.os }}-${{ runner.arch }}-otp29.1.2-elixir1.20.4-rust${{ matrix.rust }}-${{ hashFiles('mix.lock', 'native/audio_engine/Cargo.lock') }}
+
+      - name: Fetch locked dependencies
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+          git diff --exit-code -- mix.lock native/audio_engine/Cargo.lock
+          mkdir -p test/tmp/ci-logs
+
+      - name: Check native formatting and lint
+        run: |
+          cargo fmt --manifest-path native/audio_engine/Cargo.toml --check
+          cargo clippy --locked --manifest-path native/audio_engine/Cargo.toml \
+            --all-targets -- -D warnings 2>&1 | tee test/tmp/ci-logs/clippy.log
+
+      - name: Run native protocol and DSP tests
+        run: |
+          cargo test --locked --manifest-path native/audio_engine/Cargo.toml \
+            --all-targets 2>&1 | tee test/tmp/ci-logs/native-tests.log
+          mix lixi.native
+
+      - name: Check Elixir formatting and compilation
+        run: |
+          mix format --check-formatted
+          mix compile --warnings-as-errors 2>&1 | tee test/tmp/ci-logs/compile.log
+
+      - name: Run full application and four-VM fault suite
+        run: |
+          mix test --seed 0 --max-cases 8 2>&1 | tee test/tmp/ci-logs/exunit.log
+
+      - name: Exercise fault-sensitive suites in different orders
+        run: |
+          for seed in 104729 8675309; do
+            mix test test/cluster_test.exs test/upgrade_test.exs \
+              test/plugin_package_test.exs test/plugins_test.exs \
+              test/sessions_test.exs test/operations_test.exs \
+              --seed "$seed" --max-cases 8 \
+              2>&1 | tee "test/tmp/ci-logs/faults-$seed.log"
+          done
+
+      - name: Build a production release and external plugin
+        run: |
+          MIX_ENV=prod mix compile --warnings-as-errors
+          MIX_ENV=prod mix lixi.plugin.pack examples/plugins/radio \
+            --output test/runtime/ci-radio-stage/radio-1.0.0
+          MIX_ENV=prod mix release --overwrite
+
+      - name: Smoke test packaged native code, API, and plugin persistence
+        env:
+          RELEASE_DISTRIBUTION: none
+          LIXI_HOST: 127.0.0.1
+          LIXI_PORT: '0'
+          LIXI_PASSWORD: ci-test-password
+          LIXI_ADMIN_TOKEN: ci-test-admin-token-not-a-real-secret
+        run: |
+          export LIXI_DATA_DIR="$PWD/test/runtime/ci-release-data"
+          export LIXI_PLUGIN_ROOT="$PWD/test/runtime/ci-radio-stage"
+          LIXI_CI_SMOKE_MODE=install _build/prod/rel/lixi/bin/lixi \
+            eval 'Code.require_file("scripts/ci/release_smoke.exs")' \
+            2>&1 | tee test/tmp/ci-logs/release-install.log
+          env -u LIXI_PLUGIN_ROOT LIXI_CI_SMOKE_MODE=restore \
+            _build/prod/rel/lixi/bin/lixi \
+            eval 'Code.require_file("scripts/ci/release_smoke.exs")' \
+            2>&1 | tee test/tmp/ci-logs/release-restore.log
+
+      - name: Verify dependency locks and tracked sources stayed unchanged
+        run: git diff --exit-code
+
+      - name: Retain failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: failure-${{ runner.os }}-${{ runner.arch }}-rust-${{ matrix.rust }}
+          path: test/tmp/ci-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  gate:
+    name: CI
+    if: always()
+    needs: [contracts, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every check to succeed
+        env:
+          CONTRACTS_RESULT: ${{ needs.contracts.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          test "$CONTRACTS_RESULT" = success
+          test "$TEST_RESULT" = success
