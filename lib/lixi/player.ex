@@ -191,6 +191,7 @@ defmodule Lixi.Player do
        started: false,
        epoch: 0,
        worker_lease: lease,
+       swapping: nil,
        worker: nil,
        worker_monitor: nil,
        source_version: nil,
@@ -207,6 +208,34 @@ defmodule Lixi.Player do
 
   @impl true
   def handle_call(:snapshot, _, state), do: {:reply, public(state), state}
+
+  def handle_call({:swapping, :status}, _, state),
+    do: {:reply, {:ok, Lixi.Swapping.status(state)}, state}
+
+  def handle_call({:swapping, {:configure, version, body}}, _, state) do
+    {reply, state} = Lixi.Swapping.configure(state, version, body)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:swapping, {:prepare, track}}, _, state) do
+    {reply, state} = Lixi.Swapping.prepare(state, track)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:swapping, :cancel}, _, state) do
+    {reply, state} = Lixi.Swapping.cancel(state)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:swapping, :skip}, _, state) do
+    if Map.get(state, :swapping) && state.swapping.next &&
+         state.swapping.jobs[state.swapping.next].phase == :ready do
+      Worker.skip(state.worker)
+      {:reply, {:ok, %{skipping: true}}, state}
+    else
+      {:reply, {:error, :next_not_ready}, state}
+    end
+  end
 
   def handle_call({:skip_replacement, patch}, from, state) do
     if state.track != nil and patch.track != :keep do
@@ -362,6 +391,7 @@ defmodule Lixi.Player do
 
   defp restart_audio(state, position) do
     state = state |> quiesce() |> stop_worker() |> cancel_tick()
+    state = Lixi.Swapping.reset(state)
     epoch = state.epoch + 1
     if state.connection, do: state.adapter.fence(state.connection, epoch)
 
@@ -384,6 +414,13 @@ defmodule Lixi.Player do
   end
 
   defp open_worker(state, position) do
+    case Lixi.Swapping.reserve(state) do
+      {:ok, state} -> open_reserved_worker(state, position)
+      {:error, reason} -> fail_track(state, reason)
+    end
+  end
+
+  defp open_reserved_worker(state, position) do
     permit =
       case Map.get(state, :worker_lease) do
         nil -> Lixi.Admission.acquire()
@@ -393,15 +430,18 @@ defmodule Lixi.Player do
     case permit do
       {:ok, lease} ->
         state = Map.put(state, :worker_lease, lease)
+        {state, swapping_options} = Lixi.Swapping.open(state)
 
-        options = [
-          lease: lease,
-          position: position,
-          gain: state.volume / 100,
-          filters: state.filters,
-          source_version: state.source_version,
-          end_time: state.end_time
-        ]
+        options =
+          swapping_options ++
+            [
+              lease: lease,
+              position: position,
+              gain: state.volume / 100,
+              filters: state.filters,
+              source_version: state.source_version,
+              end_time: state.end_time
+            ]
 
         case Worker.start(self(), state.track["info"]["identifier"], state.epoch, options) do
           {:ok, worker} ->
@@ -436,6 +476,7 @@ defmodule Lixi.Player do
         %{worker: worker, epoch: epoch} = state
       ) do
     state = %{state | source_version: metadata[:source_version]}
+    state = Lixi.Swapping.ready(state, metadata)
     {:noreply, state |> refill() |> schedule(0)}
   end
 
@@ -462,6 +503,12 @@ defmodule Lixi.Player do
   end
 
   def handle_info(
+        {:audio, worker, epoch, {:swapping, event}},
+        %{worker: worker, epoch: epoch} = state
+      ),
+      do: {:noreply, Lixi.Swapping.native(state, event)}
+
+  def handle_info(
         {:audio, worker, epoch, {:error, {:worker_exit, _} = reason}},
         %{worker: worker, epoch: epoch} = state
       ),
@@ -473,7 +520,26 @@ defmodule Lixi.Player do
       ),
       do: {:noreply, fail_track(state, reason)}
 
-  def handle_info({:audio, _, _, _}, state), do: {:noreply, state}
+  def handle_info({:audio, worker, epoch, event}, state),
+    do: {:noreply, Lixi.Swapping.preparer_event(state, worker, epoch, event)}
+
+  def handle_info({ref, result}, %{swapping: %{starting: %{ref: ref}}} = state),
+    do: {:noreply, Lixi.Swapping.starter_result(state, ref, result)}
+
+  def handle_info({ref, {:ok, worker}}, state) when is_reference(ref) and is_pid(worker) do
+    Process.demonitor(ref, [:flush])
+    Worker.stop(worker)
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:DOWN, ref, :process, _, reason},
+        %{swapping: %{starting: %{ref: ref}}} = state
+      ),
+      do: {:noreply, Lixi.Swapping.starter_result(state, ref, {:error, reason})}
+
+  def handle_info({:DOWN, ref, :process, _, _}, %{swapping: %{preparer_monitor: ref}} = state),
+    do: {:noreply, Lixi.Swapping.preparer_down(state)}
 
   def handle_info({:voice, pid, :ready}, %{connection: pid} = state) do
     state.adapter.fence(pid, state.epoch)
@@ -554,7 +620,11 @@ defmodule Lixi.Player do
 
   def handle_info(_, state), do: {:noreply, state}
 
-  defp tick(%{track: nil} = state, _), do: cancel_tick(state)
+  defp tick(%{track: nil, count: 0, swapping: s, worker: worker} = state, _)
+       when s != nil and worker != nil,
+       do: state |> quiesce() |> schedule(100_000)
+
+  defp tick(%{track: nil, count: 0} = state, _), do: cancel_tick(state)
   defp tick(%{paused: true} = state, _), do: cancel_tick(state)
   defp tick(%{worker_done: true, count: 0} = state, _), do: finish(state, "finished")
   defp tick(%{ready: false} = state, _), do: schedule(state, 100_000)
@@ -564,10 +634,13 @@ defmodule Lixi.Player do
     state |> quiesce() |> Map.put(:buffering, true) |> schedule(100_000)
   end
 
-  defp tick(%{buffering: true, worker_done: false, count: count} = state, _) when count < 10,
-    do: schedule(state, 20_000)
+  defp tick(%{buffering: true, worker_done: false, count: count} = state, due) when count < 10 do
+    if Lixi.Swapping.tail?(state), do: dispatch(state, due), else: schedule(state, 20_000)
+  end
 
-  defp tick(state, due) do
+  defp tick(state, due), do: dispatch(state, due)
+
+  defp dispatch(state, due) do
     state = ensure_speaking(state)
     {{:value, frame}, queue} = :queue.out(state.queue)
     now = System.monotonic_time(:microsecond)
@@ -584,6 +657,7 @@ defmodule Lixi.Player do
     case result do
       :ok ->
         Lixi.Metrics.record(:sent)
+        state = Lixi.Swapping.sent(state, frame)
 
         state =
           if state.started do
@@ -609,6 +683,7 @@ defmodule Lixi.Player do
             count: state.count - 1,
             buffering: false
         }
+        |> Lixi.Swapping.after_sent()
         |> refill()
         |> schedule_at(due + 20_000)
 
@@ -641,6 +716,15 @@ defmodule Lixi.Player do
     end
   end
 
+  defp recover(%{swapping: s} = state, reason) when s != nil do
+    now = System.monotonic_time(:millisecond)
+    retries = Enum.filter(state.retries, &(now - &1 < 60_000))
+
+    if state.track && length(retries) < 3,
+      do: restart_audio(%{state | retries: [now | retries]}, state.position),
+      else: fail_track(state, reason)
+  end
+
   defp recover(%{track: nil} = state, _), do: stop_worker(state)
 
   defp recover(state, reason) do
@@ -667,7 +751,11 @@ defmodule Lixi.Player do
     %{state | worker: nil, worker_monitor: nil}
   end
 
-  defp finish(%{track: nil} = state, _), do: state
+  defp finish(%{track: nil} = state, _) do
+    state = state |> stop_worker() |> cancel_tick() |> Lixi.Swapping.clear()
+    Lixi.Admission.release(state.worker_lease)
+    %{state | worker_lease: nil, queue: :queue.new(), count: 0}
+  end
 
   defp finish(state, reason) do
     state = quiesce(state)
@@ -682,7 +770,7 @@ defmodule Lixi.Player do
 
     Lixi.Metrics.playing(self(), false)
     Registry.unregister(Lixi.Registry, {:playing, state.session, state.guild})
-    state = stop_worker(state) |> cancel_tick()
+    state = stop_worker(state) |> cancel_tick() |> Lixi.Swapping.clear()
 
     state =
       if reason == "replaced" do
@@ -792,6 +880,7 @@ defmodule Lixi.Player do
   @impl true
   def terminate(_, state) do
     Worker.stop(state.worker)
+    Lixi.Swapping.close(state)
     Lixi.Admission.release(Map.get(state, :worker_lease))
     if state.connection, do: state.adapter.close(state.connection)
   end

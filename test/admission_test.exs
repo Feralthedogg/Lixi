@@ -69,6 +69,53 @@ defmodule Lixi.AdmissionTest do
     eventually(fn -> Lixi.Admission.active() == 0 end)
   end
 
+  @tag supervisor_crash: true
+  test "released preparer leases remain charged until their physical worker exits, including restart" do
+    old = Application.get_env(:lixi, :max_preparers)
+    Application.put_env(:lixi, :max_preparers, 1)
+    on_exit(fn -> Application.put_env(:lixi, :max_preparers, old) end)
+    assert {:ok, playback, prepare} = Lixi.Admission.reserve_swapping(nil)
+    parent = self()
+
+    worker =
+      spawn(fn ->
+        :ok = Lixi.Admission.attach(prepare, nil)
+        send(parent, :prepare_bound)
+        receive do: (:stop -> :ok)
+      end)
+
+    on_exit(fn -> send(worker, :stop) end)
+    assert_receive :prepare_bound
+    Lixi.Admission.release(prepare)
+    assert Lixi.Admission.snapshot().preparers == 1
+    assert {:error, :worker_capacity} = Lixi.Admission.acquire(:prepare)
+    admission = Process.whereis(Lixi.Admission)
+    Process.exit(admission, :kill)
+
+    eventually(fn ->
+      is_pid(Process.whereis(Lixi.Admission)) and Process.whereis(Lixi.Admission) != admission
+    end)
+
+    assert Lixi.Admission.snapshot().preparers == 1
+    assert {:error, :expired} = Lixi.Admission.transfer(prepare, self())
+    assert {:error, :worker_capacity} = Lixi.Admission.acquire(:prepare)
+    send(worker, :stop)
+    eventually(fn -> Lixi.Admission.snapshot().preparers == 0 end)
+    Lixi.Admission.release(playback)
+  end
+
+  test "pair admission cannot partially consume playback when preparation is full" do
+    old = Application.get_env(:lixi, :max_preparers)
+    Application.put_env(:lixi, :max_preparers, 1)
+    on_exit(fn -> Application.put_env(:lixi, :max_preparers, old) end)
+    {:ok, prepare} = Lixi.Admission.acquire(:prepare)
+    assert {:error, :worker_capacity} = Lixi.Admission.reserve_swapping(nil)
+    assert Lixi.Admission.snapshot().playback == 0
+    assert {:ok, playback} = Lixi.Admission.acquire()
+    assert {:ok, probe} = Lixi.Admission.acquire(:probe)
+    for lease <- [prepare, playback, probe], do: Lixi.Admission.release(lease)
+  end
+
   test "initializing workers retain capacity when the requesting owner dies" do
     parent = self()
 

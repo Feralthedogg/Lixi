@@ -193,8 +193,11 @@ every entry and avoiding the same track across round boundaries where possible.
 Continuous playback does not intentionally rejoin Voice; add `--reconnect-test`
 only when testing reconnects.
 Tracks advance on TrackEnd. Failed acquisitions skip to the next entry.
+With [Swapping](swapping.md) installed, add `--swapping` to prepare the next
+track while playing, and use its private Sound Check/AutoMix controls.
 `YOUTUBE_PLAYLIST_URL` optionally selects a public playlist using `tools/yt-dlp`
-beside the private `.env`. The client fetches one Opus/WebM file at a time, with
+beside the private `.env`. The client downloads one Opus/WebM file at a time and retains the current file
+plus one prepared next file in Swapping mode, with
 a 32 MiB / 120-second per-track bound, and removes its own temporary media.
 Acquisition runs off the Gateway/control loop.
 Downloads can introduce gaps between tracks. Reports stay beside the private
@@ -212,7 +215,7 @@ The [Dockerfile](../deploy/Dockerfile) consumes a release built for the target
 Linux architecture:
 
 ```sh
-docker build -f deploy/Dockerfile -t your-registry/lixi:0.3.0 _build/prod/rel/lixi
+docker build -f deploy/Dockerfile -t your-registry/lixi:0.4.0 _build/prod/rel/lixi
 ```
 
 The [Kubernetes example](../deploy/kubernetes.yaml) includes three voters, two

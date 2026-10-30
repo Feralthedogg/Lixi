@@ -6,6 +6,9 @@ pub struct Timescale {
     processor: Option<SoundTouch>,
     scratch: Vec<f32>,
     pub speed: f64,
+    tempo: f64,
+    rate: f64,
+    pitch: f64,
 }
 
 impl Timescale {
@@ -30,7 +33,30 @@ impl Timescale {
             processor,
             scratch: Vec::new(),
             speed: speed * rate,
+            tempo: speed,
+            rate,
+            pitch,
         }
+    }
+
+    pub fn set_multiplier(&mut self, multiplier: f64) -> Result<(), &'static str> {
+        if !multiplier.is_finite() || !(0.88..=1.12).contains(&multiplier) {
+            return Err("tempo multiplier outside bounded range");
+        }
+        if self.processor.is_none() {
+            let mut processor = SoundTouch::new();
+            processor
+                .set_channels(2)
+                .set_sample_rate(48_000)
+                .set_rate(self.rate)
+                .set_pitch(self.pitch);
+            self.processor = Some(processor);
+        }
+        if let Some(processor) = &mut self.processor {
+            processor.set_tempo(self.tempo * multiplier);
+        }
+        self.speed = self.tempo * self.rate * multiplier;
+        Ok(())
     }
 
     pub fn feed(

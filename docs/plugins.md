@@ -15,6 +15,8 @@ mix lixi.plugin.pack plugins/radio --output data/plugins/staging/radio-1.0.0
 The template contains `plugin.json`, `lib/plugin.ex`, `config.example.json`, and
 a README. See the [radio example](../examples/plugins/radio/lib/plugin.ex).
 It aliases finite media resources, not indefinite live streams.
+The [Swapping plugin](swapping.md) adds prepared-next playback, music-aware
+transitions and loudness normalization.
 
 Build with the server's OTP major and Elixir major/minor. Each version uses a
 separate entry namespace, such as `RadioPlugin.V1` and `RadioPlugin.V2`.

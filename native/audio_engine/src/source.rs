@@ -1,37 +1,59 @@
 use crate::protocol::Wire;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc::Receiver,
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use symphonia::core::io::MediaSource;
+
+type Responses = Arc<Mutex<Receiver<(u64, Vec<u8>)>>>;
+
+#[derive(Clone)]
+pub struct Slot {
+    index: u8,
+    responses: Responses,
+    next_read: Arc<AtomicU64>,
+}
+impl Slot {
+    pub fn new(index: u8, responses: Receiver<(u64, Vec<u8>)>) -> Self {
+        Self {
+            index,
+            responses: Arc::new(Mutex::new(responses)),
+            next_read: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
 
 pub struct Source {
     pub length: u64,
     pub position: u64,
     pub wire: Wire,
-    responses: Mutex<Receiver<(u64, Vec<u8>)>>,
+    slot: Slot,
+    cancelled: Arc<AtomicBool>,
     pub running: Arc<AtomicBool>,
-    next_read: u64,
 }
 
 impl Source {
-    pub fn new(
+    pub fn with_slot(
         length: u64,
         wire: Wire,
-        responses: Receiver<(u64, Vec<u8>)>,
+        slot: Slot,
         running: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             length,
             position: 0,
             wire,
-            responses: Mutex::new(responses),
+            slot,
             running,
-            next_read: 0,
+            cancelled,
         }
+    }
+    fn alive(&self) -> bool {
+        self.running.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -44,24 +66,46 @@ impl Read for Source {
         if length == 0 {
             return Ok(0);
         }
-        if !self.running.load(Ordering::Acquire) {
+        if !self.alive() {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        self.next_read += 1;
+        let counter = self.slot.next_read.fetch_add(1, Ordering::AcqRel) + 1;
+        if counter >= (1u64 << 63) {
+            return Err(io::Error::other("source request counter exhausted"));
+        }
+        let request_id = (u64::from(self.slot.index) << 63) | counter;
         let mut request = [0; 12];
         request[..8].copy_from_slice(&self.position.to_be_bytes());
         request[8..].copy_from_slice(&(length as u32).to_be_bytes());
-        self.wire.send(3, self.next_read, &request)?;
-        let (id, packet) = self
+        self.wire.send(3, request_id, &request)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let receiver = self
+            .slot
             .responses
-            .get_mut()
-            .map_err(|_| io::Error::other("source lock poisoned"))?
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "source read timed out"))?;
+            .lock()
+            .map_err(|_| io::Error::other("source lock poisoned"))?;
+        let (id, packet) = loop {
+            if !self.alive() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok((id, _)) if id < request_id => continue,
+                Ok(response) => break response,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {
+                    continue
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "source read timed out",
+                    ))
+                }
+            }
+        };
         let bytes = packet
             .get(crate::protocol::HEADER..)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short source response"))?;
-        if id != self.next_read || bytes.len() > length || bytes.is_empty() {
+        if id != request_id || bytes.len() > length || bytes.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid source response",

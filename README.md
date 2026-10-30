@@ -28,6 +28,7 @@ information through the Lavalink API and does not require a bot token.
   channelMix, and lowPass filters.
 - Isolated Rust audio workers with bounded input reads and output credits.
 - BEAM plugin packages with source/HTTP callbacks and version leases.
+- [Swapping](docs/swapping.md): ready-next playback, AutoMix transitions and Sound Check.
 - Compatible live BEAM patches, rollback, drain, and readiness checks.
 - Raft ownership metadata with additional worker instances.
 
@@ -170,4 +171,5 @@ release startup with plugin restoration.
 [API](docs/api.md) ·
 [Architecture](docs/architecture.md) ·
 [Plugins](docs/plugins.md) ·
+[Swapping](docs/swapping.md) ·
 [Operations](docs/operations.md)

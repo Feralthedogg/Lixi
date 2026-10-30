@@ -18,7 +18,7 @@ Use the password directly, without `Bearer`. `/version`, `/health/live`, and
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| GET | `/version` | Text version, such as `4.0.0+lixi.0.3.0` |
+| GET | `/version` | Text version, such as `4.0.0+lixi.0.4.0` |
 | GET | `/v4/info` | Capabilities and active plugins |
 | GET | `/v4/stats` | Local instance statistics |
 | GET | `/v4/loadtracks?identifier=...` | Resolve a source or plugin identifier |

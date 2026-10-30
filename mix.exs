@@ -4,7 +4,7 @@ defmodule Lixi.MixProject do
   def project do
     [
       app: :lixi,
-      version: "0.3.0",
+      version: "0.4.0",
       elixir: "~> 1.20",
       elixirc_paths: if(Mix.env() == :test, do: ["lib", "test/support"], else: ["lib"]),
       start_permanent: Mix.env() == :prod,

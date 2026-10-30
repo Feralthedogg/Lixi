@@ -4,6 +4,7 @@ defmodule Lixi.Admission do
 
   def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
   def acquire(purpose \\ :playback), do: GenServer.call(__MODULE__, {:acquire, purpose, self()})
+  def reserve_swapping(lease), do: GenServer.call(__MODULE__, {:swapping, lease, self()})
   def transfer(lease, owner), do: GenServer.call(__MODULE__, {:transfer, lease, owner})
   def attach(lease, os_pid), do: GenServer.call(__MODULE__, {:attach, lease, os_pid, self()})
   def release(nil), do: :ok
@@ -18,7 +19,9 @@ defmodule Lixi.Admission do
 
   def snapshot do
     leases =
-      for {lease, item, :active} <- :ets.tab2list(__MODULE__), alive?(item), do: {lease, item}
+      for {lease, item, status} <- :ets.tab2list(__MODULE__),
+          (status == :active and alive?(item)) or live_worker?(item),
+          do: {lease, item}
 
     playback = Enum.count(leases, fn {_, item} -> item.purpose == :playback end)
     pids = for {_, item} <- leases, live_worker?(item), is_integer(item.os_pid), do: item.os_pid
@@ -26,9 +29,11 @@ defmodule Lixi.Admission do
     %{
       active: length(leases),
       playback: playback,
-      probes: length(leases) - playback,
+      probes: Enum.count(leases, fn {_, item} -> item.purpose == :probe end),
+      preparers: Enum.count(leases, fn {_, item} -> item.purpose == :prepare end),
       max_playback: limit(:playback),
       max_probes: limit(:probe),
+      max_preparers: limit(:prepare),
       os_pids: pids
     }
   end
@@ -37,8 +42,7 @@ defmodule Lixi.Admission do
 
   def init(_) do
     entries = :ets.tab2list(__MODULE__)
-    for {lease, _, status} <- entries, status != :active, do: :ets.delete(__MODULE__, lease)
-    leases = Map.new(for {lease, item, :active} <- entries, do: {lease, item})
+    leases = Map.new(for {lease, item, _} <- entries, do: {lease, item})
 
     state =
       Map.new(prune(leases), fn {lease, item} ->
@@ -55,23 +59,40 @@ defmodule Lixi.Admission do
     {:ok, state}
   end
 
-  def handle_call({:acquire, purpose, owner}, _, state) when purpose in [:playback, :probe] do
+  def handle_call({:swapping, existing, owner}, _, state) do
+    state = prune(state)
+
+    existing_valid =
+      existing == nil or
+        (active?(existing) and match?(%{owner: ^owner, purpose: :playback}, state[existing]))
+
+    purposes = if existing == nil, do: [:playback, :prepare], else: [:prepare]
+
+    if existing_valid and
+         Enum.all?(purposes, fn purpose ->
+           Enum.count(state, fn {_, item} -> item.purpose == purpose end) < limit(purpose)
+         end) do
+      {leases, state} =
+        Enum.map_reduce(purposes, state, fn purpose, acc ->
+          {lease, item} = new_lease(purpose, owner)
+          {lease, Map.put(acc, lease, item)}
+        end)
+
+      changed()
+      [playback, prepare] = if existing == nil, do: leases, else: [existing | leases]
+      {:reply, {:ok, playback, prepare}, state}
+    else
+      {:reply, {:error, :worker_capacity}, state}
+    end
+  end
+
+  def handle_call({:acquire, purpose, owner}, _, state)
+      when purpose in [:playback, :probe, :prepare] do
     state = prune(state)
     limit = limit(purpose)
 
     if Enum.count(state, fn {_, item} -> item.purpose == purpose end) < limit do
-      lease = make_ref()
-
-      item = %{
-        owner: owner,
-        monitor: Process.monitor(owner),
-        purpose: purpose,
-        os_pid: nil,
-        worker: nil,
-        worker_monitor: nil
-      }
-
-      :ets.insert(__MODULE__, {lease, item, :active})
+      {lease, item} = new_lease(purpose, owner)
       changed()
       {:reply, {:ok, lease}, Map.put(state, lease, item)}
     else
@@ -125,12 +146,9 @@ defmodule Lixi.Admission do
     end
   end
 
-  def handle_cast({:release, lease}, state) do
-    :ets.delete(__MODULE__, lease)
-    {item, state} = Map.pop(state, lease)
-    if item, do: demonitor(item)
+  def handle_cast({:release, _lease}, state) do
     changed()
-    {:noreply, state}
+    {:noreply, prune(state)}
   end
 
   def handle_info({:DOWN, ref, _, _, _}, state) do
@@ -151,7 +169,7 @@ defmodule Lixi.Admission do
 
   defp prune(state) do
     Map.reject(state, fn {lease, item} ->
-      if alive?(item) and active?(lease) do
+      if (alive?(item) and active?(lease)) or live_worker?(item) do
         false
       else
         demonitor(item)
@@ -178,6 +196,23 @@ defmodule Lixi.Admission do
 
   defp limit(:playback), do: Application.fetch_env!(:lixi, :max_workers)
   defp limit(:probe), do: Application.fetch_env!(:lixi, :max_probe_workers)
+  defp limit(:prepare), do: Application.get_env(:lixi, :max_preparers, 10)
+
+  defp new_lease(purpose, owner) do
+    lease = make_ref()
+
+    item = %{
+      owner: owner,
+      monitor: Process.monitor(owner),
+      purpose: purpose,
+      os_pid: nil,
+      worker: nil,
+      worker_monitor: nil
+    }
+
+    :ets.insert(__MODULE__, {lease, item, :active})
+    {lease, item}
+  end
 
   defp changed do
     if pid = Process.whereis(Lixi.Cluster.Member), do: send(pid, :heartbeat)

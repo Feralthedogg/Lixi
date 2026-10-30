@@ -154,6 +154,7 @@ jobs:
               test/plugin_package_test.exs test/plugins_test.exs \
               test/sessions_test.exs test/operations_test.exs \
               test/admission_test.exs test/metrics_test.exs test/audio_test.exs \
+              test/swapping_test.exs \
               test/web_socket_test.exs test/validation_test.exs test/voice_test.exs \
               --seed "$seed" --max-cases 8 \
               2>&1 | tee "test/tmp/ci-logs/faults-$seed.log"
@@ -164,6 +165,8 @@ jobs:
           MIX_ENV=prod mix compile --warnings-as-errors
           MIX_ENV=prod mix lixi.plugin.pack examples/plugins/radio \
             --output test/runtime/ci-radio-stage/radio-1.0.0
+          MIX_ENV=prod mix lixi.plugin.pack examples/plugins/swapping \
+            --output test/runtime/ci-radio-stage/swapping-1.0.0
           MIX_ENV=prod mix release --overwrite
 
       - name: Smoke test packaged native code, API, and plugin persistence

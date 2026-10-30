@@ -147,7 +147,23 @@ defmodule Lixi.Validation.Soak do
     guild = Map.fetch!(config, "DISCORD_GUILD_ID")
     channel = Map.fetch!(config, "DISCORD_CHANNEL_ID")
     endpoint = origin <> "/v4/sessions/#{session}/players/#{guild}"
+    plugin_path = "/v4/plugins/swapping/sessions/#{session}/players/#{guild}"
+    swapping = config["SWAPPING_ENABLED"] == "true" or "--swapping" in System.argv()
     auth = [{~c"authorization", String.to_charlist(password)}]
+
+    if swapping do
+      settings =
+        case File.read(Path.join(private, "swapping.json")) do
+          {:ok, bytes} -> Jason.decode!(bytes)
+          {:error, :enoent} -> %{"soundCheck" => true, "autoMix" => true}
+        end
+
+      request!(:put, origin <> plugin_path, auth, Map.put(settings, "enabled", true))
+      control = Path.join(private, "state/control.json")
+      File.write!(control, Jason.encode!(%{endpoint: plugin_path}))
+      File.chmod!(control, 0o600)
+    end
+
     started = System.monotonic_time(:millisecond)
 
     state = %{
@@ -167,6 +183,15 @@ defmodule Lixi.Validation.Soak do
       media_dir: media_dir,
       media_file: nil,
       media_task: nil,
+      media_mode: :current,
+      current_identifier: nil,
+      swapping: swapping,
+      plugin_endpoint: origin <> plugin_path,
+      stage: nil,
+      next_playlist: nil,
+      retired_files: %{},
+      completed: false,
+      playing: false,
       source_failures: 0,
       consecutive_failures: 0,
       voice_session: nil,
@@ -244,6 +269,7 @@ defmodule Lixi.Validation.Soak do
       WebSockex.cast(socket, :close)
       Application.stop(:eda)
       File.rm_rf!(media_dir)
+      if swapping, do: File.rm(Path.join(private, "state/control.json"))
     end
   end
 
@@ -283,6 +309,10 @@ defmodule Lixi.Validation.Soak do
 
       state.first_frame != nil and Watch.expired?(state.watch, now) ->
         raise("Voice did not recover media delivery within 30 seconds")
+
+      state.swapping and state.stage != nil and not state.stage.submitted and
+          now >= state.stage.try_after ->
+        submit_next(state, now) |> loop()
 
       is_integer(state.next_reconnect) and now >= state.next_reconnect and not state.leave_pending ->
         EDA.Gateway.Connection.update_voice_state(state.guild, nil,
@@ -331,7 +361,14 @@ defmodule Lixi.Validation.Soak do
 
     %{
       state
-      | watch: Watch.sample(state.watch, connected, position, now, state.media_task == nil),
+      | watch:
+          Watch.sample(
+            state.watch,
+            connected,
+            position,
+            now,
+            if(state.swapping, do: state.playing, else: state.media_task == nil)
+          ),
         metrics: metrics,
         next_poll: now + 5000
     }
@@ -367,7 +404,7 @@ defmodule Lixi.Validation.Soak do
       else: state
   end
 
-  defp handle({:lavalink, %{"type" => "TrackStartEvent"}}, state, now) do
+  defp handle({:lavalink, %{"type" => "TrackStartEvent"} = event}, state, now) do
     state =
       if state.first_frame == nil do
         %{
@@ -382,7 +419,128 @@ defmodule Lixi.Validation.Soak do
         state
       end
 
-    %{state | watch: Watch.delivered(state.watch)}
+    state =
+      if state.swapping && state.stage &&
+           get_in(event, ["track", "info", "identifier"]) == state.stage.identifier do
+        retired =
+          if state.media_file,
+            do: Map.put(state.retired_files, state.current_identifier, state.media_file),
+            else: state.retired_files
+
+        %{
+          state
+          | playlist: state.stage.playlist,
+            media_file: state.stage.file,
+            current_identifier: state.stage.identifier,
+            stage: nil,
+            retired_files: retired,
+            tracks: state.tracks + 1
+        }
+      else
+        state
+      end
+
+    state = %{
+      state
+      | watch: Watch.delivered(%{state.watch | last_position: nil}),
+        playing: true,
+        completed: false
+    }
+
+    if state.swapping, do: prefetch(state), else: state
+  end
+
+  defp handle(
+         {:lavalink, %{"type" => "TrackEndEvent", "reason" => "stopped"}},
+         %{swapping: true} = state,
+         now
+       ),
+       do: %{state | until: now, playing: false}
+
+  defp handle(
+         {:lavalink, %{"type" => "TrackEndEvent", "reason" => "loadFailed"}},
+         %{swapping: true},
+         _
+       ),
+       do: raise("Swapping renderer failed; restarting validation session")
+
+  defp handle(
+         {:lavalink, %{"type" => "TrackEndEvent", "reason" => "finished"}},
+         %{swapping: true} = state,
+         _
+       ) do
+    prefetch(%{
+      state
+      | completed: true,
+        playing: false,
+        watch: %{state.watch | last_position: nil}
+    })
+  end
+
+  defp handle(
+         {:lavalink, %{"type" => "SwappingRetiredEvent", "track" => track}},
+         %{swapping: true} = state,
+         _
+       ) do
+    identifier = track["info"]["identifier"]
+    {file, retired} = Map.pop(state.retired_files, identifier)
+    if file, do: delete_media(state, file)
+    state = %{state | retired_files: retired}
+
+    state =
+      cond do
+        state.stage && state.stage.identifier == identifier ->
+          if state.stage.file, do: delete_media(state, state.stage.file)
+
+          next =
+            if state.stage.failed,
+              do: Playlist.next(state.stage.playlist),
+              else: state.stage.playlist
+
+          %{state | stage: nil, next_playlist: next}
+
+        state.completed && state.current_identifier == identifier ->
+          if state.media_file, do: delete_media(state, state.media_file)
+          %{state | media_file: nil, current_identifier: nil}
+
+        true ->
+          state
+      end
+
+    prefetch(state)
+  end
+
+  defp handle(
+         {:lavalink, %{"type" => "SwappingPrepareFailedEvent", "reason" => "prepareFailed"}},
+         %{swapping: true} = state,
+         _
+       ) do
+    if state.consecutive_failures + 1 >= Playlist.size(state.playlist),
+      do: raise("No playlist track could be prepared")
+
+    stage = if state.stage, do: %{state.stage | failed: true}, else: nil
+
+    %{
+      state
+      | stage: stage,
+        source_failures: state.source_failures + 1,
+        consecutive_failures: state.consecutive_failures + 1
+    }
+  end
+
+  defp handle(
+         {:lavalink, %{"type" => "SwappingResetEvent"} = event},
+         %{swapping: true} = state,
+         now
+       ) do
+    stage =
+      if state.stage && state.stage.submitted && state.stage.epoch < event["epoch"],
+        do: %{state.stage | submitted: false, attempts: 0, try_after: now + 250},
+        else: state.stage
+
+    for {_, file} <- state.retired_files, do: delete_media(state, file)
+    state = %{state | stage: stage, retired_files: %{}}
+    if state.playing, do: prefetch(state), else: state
   end
 
   defp handle({:lavalink, %{"type" => "TrackEndEvent", "reason" => reason}}, state, _)
@@ -410,19 +568,49 @@ defmodule Lixi.Validation.Soak do
 
     case result do
       {:ok, identifier, media_file} ->
-        request!(:patch, state.endpoint, state.auth, %{track: %{identifier: identifier}})
-        %{state | tracks: state.tracks + 1, media_file: media_file, consecutive_failures: 0}
+        if state.media_mode == :next do
+          state = %{
+            state
+            | stage: %{
+                identifier: identifier,
+                file: media_file,
+                playlist: state.next_playlist,
+                submitted: false,
+                attempts: 0,
+                try_after: 0,
+                epoch: 0,
+                failed: false
+              },
+              next_playlist: nil,
+              consecutive_failures: 0
+          }
+
+          submit_next(state, System.monotonic_time(:millisecond))
+        else
+          request!(:patch, state.endpoint, state.auth, %{track: %{identifier: identifier}})
+
+          %{
+            state
+            | tracks: state.tracks + 1,
+              media_file: media_file,
+              current_identifier: identifier,
+              consecutive_failures: 0
+          }
+        end
 
       :error ->
         if state.consecutive_failures + 1 >= Playlist.size(state.playlist),
           do: raise("No playlist media could be acquired")
 
-        play(%{
+        state = %{
           state
-          | playlist: Playlist.next(state.playlist),
-            source_failures: state.source_failures + 1,
+          | source_failures: state.source_failures + 1,
             consecutive_failures: state.consecutive_failures + 1
-        })
+        }
+
+        if state.media_mode == :next,
+          do: download(%{state | next_playlist: Playlist.next(state.next_playlist)}, :next),
+          else: play(%{state | playlist: Playlist.next(state.playlist)})
     end
   end
 
@@ -451,24 +639,83 @@ defmodule Lixi.Validation.Soak do
   defp play(%{media_task: task} = state) when task != nil, do: state
 
   defp play(state) do
-    if state.media_file, do: File.rm!(state.media_file)
-    identifier = Playlist.current(state.playlist)
+    if state.media_file, do: delete_media(state, state.media_file)
+    download(%{state | media_file: nil}, :current)
+  end
+
+  defp prefetch(%{media_task: nil, stage: nil, retired_files: retired} = state)
+       when map_size(retired) == 0 do
+    download(
+      %{state | next_playlist: state.next_playlist || Playlist.next(state.playlist)},
+      :next
+    )
+  end
+
+  defp prefetch(state), do: state
+
+  defp submit_next(state, now) do
+    if state.stage.attempts >= 20, do: raise("Next preparation remained unavailable")
+
+    accepted =
+      try do
+        request!(:post, state.plugin_endpoint <> "/next", state.auth, %{
+          track: %{identifier: state.stage.identifier}
+        })
+      rescue
+        _ ->
+          # Recover an accepted request whose HTTP response was lost before retrying.
+          try do
+            status = request!(:get, state.plugin_endpoint, state.auth)
+
+            if Enum.any?(
+                 status["jobs"] || [],
+                 &(get_in(&1, ["track", "info", "identifier"]) == state.stage.identifier)
+               ), do: status, else: nil
+          rescue
+            _ -> nil
+          end
+      end
+
+    if accepted do
+      %{state | stage: %{state.stage | submitted: true, epoch: accepted["epoch"]}}
+    else
+      attempts = state.stage.attempts + 1
+
+      %{
+        state
+        | stage: %{state.stage | attempts: attempts, try_after: now + min(attempts * 250, 2000)}
+      }
+    end
+  end
+
+  defp download(state, mode) do
+    playlist = if mode == :next, do: state.next_playlist, else: state.playlist
+    identifier = Playlist.current(playlist)
 
     task =
       Task.async(fn ->
         try do
           if String.starts_with?(identifier, "https://www.youtube.com/watch?") do
-            %{"path" => path} =
-              media_command([
-                "download",
-                identifier,
-                "--extractor",
-                state.extractor,
-                "--directory",
-                state.media_dir
-              ])
+            directory = Path.join(state.media_dir, Base.encode16(:crypto.strong_rand_bytes(8)))
+            File.mkdir!(directory)
 
-            {:ok, path, path}
+            try do
+              %{"path" => path} =
+                media_command([
+                  "download",
+                  identifier,
+                  "--extractor",
+                  state.extractor,
+                  "--directory",
+                  directory
+                ])
+
+              {:ok, path, path}
+            rescue
+              error ->
+                File.rm_rf!(directory)
+                reraise error, __STACKTRACE__
+            end
           else
             {:ok, identifier, nil}
           end
@@ -478,7 +725,17 @@ defmodule Lixi.Validation.Soak do
       end)
 
     Process.put(:media_task, task)
-    %{state | media_task: task, media_file: nil}
+    %{state | media_task: task, media_mode: mode}
+  end
+
+  defp delete_media(state, file) do
+    if String.starts_with?(Path.expand(file), state.media_dir <> "/") do
+      File.rm!(file)
+      directory = Path.dirname(file)
+      if directory != state.media_dir, do: File.rmdir(directory)
+    else
+      raise("Refusing to delete media outside this validation run")
+    end
   end
 
   defp write_report(private, report) do

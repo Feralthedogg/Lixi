@@ -57,6 +57,15 @@ defmodule Lixi.CI.ReleaseSmoke do
 
         {200, _} =
           request(origin, :post, "/v4/lixi/plugins/radio/activate", :admin, %{version: "1.0.0"})
+
+        {201, _} =
+          request(origin, :post, "/v4/lixi/plugins/packages", :admin, %{
+            bundle: "swapping-1.0.0",
+            config: %{}
+          })
+
+        {200, _} =
+          request(origin, :post, "/v4/lixi/plugins/swapping/activate", :admin, %{version: "1.0.0"})
       end
 
       {200, health} = request(origin, :get, "/v4/plugins/radio/health", :client)
@@ -114,7 +123,15 @@ defmodule Lixi.CI.ReleaseSmoke do
         end
 
       player = "/v4/sessions/#{session}/players/456"
+      swapping = "/v4/plugins/swapping/sessions/#{session}/players/456"
+      {200, _} = request(origin, :put, swapping, :client, %{enabled: true})
       {200, _} = request(origin, :patch, player, :client, %{track: %{encoded: encoded}})
+
+      {202, _} =
+        request(origin, :post, swapping <> "/next", :client, %{track: %{encoded: encoded}})
+
+      {200, swapping_status} = request(origin, :get, swapping, :client)
+      check!(Jason.decode!(swapping_status)["enabled"] == true, "restored Swapping plugin")
       {200, body} = request(origin, :get, player, :client)
       check!(Jason.decode!(body)["track"]["encoded"] == encoded, "Player track round trip")
       {200, _} = request(origin, :post, "/v4/lixi/drain", :admin)
@@ -170,7 +187,7 @@ defmodule Lixi.CI.ReleaseSmoke do
     url = String.to_charlist(origin <> path)
 
     request =
-      if method in [:post, :patch],
+      if method in [:post, :patch, :put],
         do: {url, headers, ~c"application/json", Jason.encode!(body)},
         else: {url, headers}
 

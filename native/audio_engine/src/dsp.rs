@@ -176,6 +176,12 @@ impl Dsp {
     }
 
     pub fn process(&mut self, frame: &mut [f32; 2], gain: f32) {
+        self.process_inner(frame, gain, true);
+    }
+    pub fn process_mix(&mut self, frame: &mut [f32; 2], gain: f32) {
+        self.process_inner(frame, gain, false);
+    }
+    fn process_inner(&mut self, frame: &mut [f32; 2], gain: f32, clip: bool) {
         for band in &mut self.bands {
             band.process(frame);
         }
@@ -228,7 +234,10 @@ impl Dsp {
                     + scale * input;
             }
             let pan = pan.map_or(1., |p| if channel == 0 { p } else { 1. - p });
-            *sample = (*sample * self.volume * gain * tremolo * pan).clamp(-1., 1.);
+            *sample = *sample * self.volume * gain * tremolo * pan;
+            if clip {
+                *sample = sample.clamp(-1., 1.);
+            }
             if !sample.is_finite() {
                 *sample = 0.;
             }

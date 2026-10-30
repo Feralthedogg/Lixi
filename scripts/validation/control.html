@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lixi · Swapping</title>
+<style>
+:root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#202020;color:#f3f3f3}*{box-sizing:border-box}body{max-width:660px;margin:10vh auto;padding:32px}header{display:flex;align-items:center;gap:12px;margin-bottom:40px}.mark{display:grid;place-items:center;width:40px;height:40px;background:#fa3155;border-radius:12px;font-weight:800}h1{font-size:27px;margin:0;letter-spacing:-.5px}.sub{color:#aaa;font-size:14px;margin:5px 0 0}.panel{background:#2b2b2b;border:1px solid #383838;border-radius:18px;overflow:hidden}label{display:grid;grid-template-columns:32px 1fr;column-gap:12px;padding:25px 24px;cursor:pointer}label+label{border-top:1px solid #414141}input{appearance:none;width:30px;height:30px;border:2px solid #777;border-radius:9px;margin:0;background:#333;cursor:pointer}input:checked{background:#fa3155;border-color:#fa3155}input:checked:after{content:"";display:block;margin:3px 7px;width:8px;height:15px;border:solid white;border-width:0 3px 3px 0;transform:rotate(42deg)}input:focus-visible{outline:3px solid #ffa3b4;outline-offset:4px}input:disabled{opacity:.5}strong{font-size:22px;line-height:30px;font-weight:650}label p{color:#cecece;margin:12px 0 0;font-size:16px;line-height:1.5}#status{margin:20px 2px 8px;color:#bbb;font-size:14px;min-height:42px;line-height:1.6}.track{margin:18px 0;padding:15px 2px;border-top:1px solid #3b3b3b;font-size:14px;color:#aaa}.track span{display:block;color:#eee;margin-top:7px;overflow-wrap:anywhere}footer{font-size:12px;color:#888;margin-top:20px}@media(max-width:600px){body{margin:4vh auto;padding:20px}label{padding:22px 18px}strong{font-size:20px}}
+</style>
+<header><div class="mark">L</div><div><h1>Swapping</h1><p class="sub">현재 곡 재생 · 다음 곡 준비</p></div></header>
+<main class="panel">
+<label><input id="soundCheck" type="checkbox" checked><div><strong>사운드 자동 조절</strong><p>노래 재생 음량을 동일하게 자동으로 조절합니다.</p></div></label>
+<label><input id="autoMix" type="checkbox" checked><div><strong>AutoMix</strong><p>곡의 박자와 조성을 분석해 다음 곡으로 자연스럽게 전환합니다.</p></div></label>
+</main>
+<p id="status" role="status" aria-live="polite">설정을 불러오는 중…</p>
+<div class="track">지금 재생 중<span id="current">—</span></div>
+<div class="track">다음 곡<span id="next">—</span></div>
+<footer>Lixi의 독립적인 전환 엔진입니다. Apple Music과 동일한 알고리즘을 사용하지 않습니다.</footer>
+<script nonce="__NONCE__">
+const ids = ['soundCheck', 'autoMix'];
+const status = document.getElementById('status');
+let saving = false;
+let refreshing = false;
+
+function show(state) {
+  if (!saving) {
+    for (const id of ids) {
+      document.getElementById(id).checked = state.desired[id];
+    }
+  }
+  let message = state.active
+    ? '재생 중인 플레이어에 연결됐습니다.'
+    : '설정을 저장하면 Swapping 플레이어의 다음 실행에 적용됩니다.';
+  if (state.live?.settings && state.live.applied &&
+      state.live.settings.autoMix !== state.live.applied.autoMix) {
+    message = 'AutoMix 변경은 다음에 준비하는 곡부터 적용됩니다.';
+  }
+  status.textContent = message;
+  for (const key of ['current', 'next']) {
+    const job = state.live?.jobs?.find(item => item.tag === state.live[key]);
+    document.getElementById(key).textContent = job?.track?.info?.title ?? '—';
+  }
+}
+
+async function refresh() {
+  if (saving || refreshing) return;
+  refreshing = true;
+  try {
+    const response = await fetch('/api/state', {signal: AbortSignal.timeout(8000)});
+    if (!response.ok) throw new Error('Settings unavailable');
+    const state = await response.json();
+    if (!saving) show(state);
+  } catch {
+    if (!saving) status.textContent = '설정 서버에 연결할 수 없습니다.';
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function save() {
+  saving = true;
+  for (const id of ids) document.getElementById(id).disabled = true;
+  try {
+    const body = Object.fromEntries(ids.map(id => [id, document.getElementById(id).checked]));
+    const response = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Lixi-Control': '__NONCE__'},
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!response.ok) throw new Error('Settings rejected');
+    const state = await response.json();
+    saving = false;
+    show(state);
+  } catch {
+    status.textContent = '설정을 적용하지 못했습니다. 다시 시도해 주세요.';
+  } finally {
+    saving = false;
+    for (const id of ids) document.getElementById(id).disabled = false;
+  }
+}
+
+for (const id of ids) document.getElementById(id).addEventListener('change', save);
+refresh();
+const poll = setInterval(refresh, 3000);
+addEventListener('pagehide', () => clearInterval(poll));
+</script>
+</html>

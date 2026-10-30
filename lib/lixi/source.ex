@@ -2,20 +2,23 @@ defmodule Lixi.Source do
   @moduledoc "Owns source handles and serves bounded, version-checked random reads."
   use GenServer
 
-  def start_link(identifier), do: GenServer.start_link(__MODULE__, identifier)
+  def start_link(identifier), do: GenServer.start_link(__MODULE__, {identifier, self()})
+  def start(identifier, owner), do: GenServer.start(__MODULE__, {identifier, owner})
+  def close(pid), do: GenServer.cast(pid, :close)
   def describe(pid), do: GenServer.call(pid, :describe)
   def read(pid, offset, length), do: GenServer.call(pid, {:read, offset, length}, 7_000)
 
   @impl true
-  def init(identifier) do
+  def init({identifier, owner}) do
     case open(identifier) do
-      {:ok, source} -> {:ok, source}
+      {:ok, source} -> {:ok, Map.put(source, :owner_monitor, Process.monitor(owner))}
       {:error, reason} -> {:stop, reason}
     end
   end
 
   @impl true
-  def handle_call(:describe, _, state), do: {:reply, Map.drop(state, [:file]), state}
+  def handle_call(:describe, _, state),
+    do: {:reply, Map.drop(state, [:file, :owner_monitor]), state}
 
   def handle_call({:read, offset, length}, _, state)
       when is_integer(offset) and offset >= 0 and length in 1..65_536 do
@@ -28,6 +31,13 @@ defmodule Lixi.Source do
   end
 
   def handle_call({:read, _, _}, _, state), do: {:reply, {:error, :range}, state}
+
+  @impl true
+  def handle_cast(:close, state), do: {:stop, :normal, state}
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _, _}, %{owner_monitor: ref} = state),
+    do: {:stop, :normal, state}
 
   @impl true
   def terminate(_, %{file: file}), do: :file.close(file)

@@ -1,31 +1,24 @@
+mod analysis;
+mod deck;
 mod dsp;
 mod opus_decoder;
 mod pcm;
 mod protocol;
 mod source;
+mod swapping;
 mod timescale;
 
 use opus::{Application, Channels, Encoder};
 use rubato::{FftFixedInOut, Resampler};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
-use std::io;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Condvar, Mutex,
 };
-use symphonia::core::{
-    codecs::{Decoder, DecoderOptions, CODEC_TYPE_OPUS},
-    errors::Error,
-    formats::{FormatOptions, SeekMode, SeekTo},
-    io::MediaSourceStream,
-    meta::MetadataOptions,
-    probe::Hint,
-    units::Time,
-};
+use std::{collections::VecDeque, io};
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Open {
     length: u64,
     extension: String,
@@ -37,6 +30,19 @@ struct Open {
     gain: f32,
     #[serde(default)]
     filters: Value,
+    #[serde(default)]
+    swapping: Option<analysis::Settings>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    tag: u64,
+    #[serde(default = "unity64")]
+    tempo_multiplier: f64,
+    #[serde(default)]
+    report: Option<analysis::Report>,
+}
+fn unity64() -> f64 {
+    1.
 }
 fn unity() -> f32 {
     1.0
@@ -46,6 +52,8 @@ struct Control {
     limit: u64,
     emitted: u64,
     gain: f32,
+    commands: VecDeque<swapping::Command>,
+    revision: u64,
 }
 type Shared = Arc<(Mutex<Control>, Condvar)>;
 
@@ -73,128 +81,35 @@ impl RateConverter {
 fn run(
     open: Open,
     wire: protocol::Wire,
-    responses: mpsc::Receiver<(u64, Vec<u8>)>,
+    slots: [source::Slot; 2],
     running: Arc<AtomicBool>,
     control: Shared,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let source = source::Source::new(open.length, wire.clone(), responses, running.clone());
-    let stream = MediaSourceStream::new(Box::new(source), Default::default());
-    let mut hint = Hint::new();
-    hint.with_extension(&open.extension);
-    let probed = symphonia::default::get_probe().format(
-        &hint,
-        stream,
-        &FormatOptions::default(),
-        &MetadataOptions {
-            limit_metadata_bytes: symphonia::core::meta::Limit::Maximum(1_048_576),
-            ..Default::default()
-        },
-    )?;
-    let mut format = probed.format;
-    let track = format
-        .tracks()
-        .iter()
-        .find(|track| {
-            track.codec_params.sample_rate.is_some() && track.codec_params.channels.is_some()
-        })
-        .ok_or("no audio track")?;
-    let track_id = track.id;
-    let rate = track
-        .codec_params
-        .sample_rate
-        .ok_or("unknown sample rate")?;
-    let channels = track
-        .codec_params
-        .channels
-        .ok_or("unknown channel layout")?
-        .count();
-    if !(8_000..=192_000).contains(&rate) || !(1..=2).contains(&channels) {
-        return Err("unsupported audio layout".into());
+) -> Result<(), deck::AudioError> {
+    if open
+        .swapping
+        .as_ref()
+        .is_some_and(|settings| !settings.valid())
+        || !(0.88..=1.12).contains(&open.tempo_multiplier)
+    {
+        return Err("invalid Swapping settings".into());
     }
-    let length_ms = if track.codec_params.codec == CODEC_TYPE_OPUS {
-        track.codec_params.n_frames.unwrap_or(0).div_ceil(48)
-    } else {
-        track.codec_params.n_frames.map_or(0, |n| {
-            let time = track
-                .codec_params
-                .time_base
-                .unwrap_or(symphonia::core::units::TimeBase::new(1, rate))
-                .calc_time(n);
-            time.seconds * 1000 + (time.frac * 1000.).round() as u64
-        })
-    };
-    let opus_samples = if track.codec_params.codec == CODEC_TYPE_OPUS {
-        track.codec_params.n_frames
-    } else {
-        None
-    };
-    let timebase = track.codec_params.time_base;
-    let mut decoder: Box<dyn Decoder> = if track.codec_params.codec == CODEC_TYPE_OPUS {
-        Box::new(opus_decoder::OpusDecoder::try_new(
-            &track.codec_params,
-            &DecoderOptions::default(),
-        )?)
-    } else {
-        symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?
-    };
-    wire.send(
-        2,
-        0,
-        &serde_json::to_vec(
-            &json!({"length": length_ms, "sampleRate": rate, "channels": channels}),
-        )?,
-    )?;
-    let mut skip_samples = 0;
-    if open.position > 0 {
-        let seek = format.seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time: Time::new(open.position / 1000, (open.position % 1000) as f64 / 1000.),
-                track_id: Some(track_id),
-            },
-        )?;
-        decoder.reset();
-        if let Some(tb) = timebase {
-            let actual = tb.calc_time(seek.actual_ts);
-            let actual_samples =
-                actual.seconds * u64::from(rate) + (actual.frac * f64::from(rate)).round() as u64;
-            skip_samples =
-                (open.position * u64::from(rate) / 1000).saturating_sub(actual_samples) as usize;
-        }
+    if open.mode.as_deref() == Some("prepare") {
+        return swapping::prepare(open, wire, slots[0].clone(), running, control);
     }
+    if open.swapping.is_some() {
+        return swapping::render(open, wire, slots, running, control);
+    }
+    let source = source::Source::with_slot(
+        open.length,
+        wire.clone(),
+        slots[0].clone(),
+        running.clone(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let mut deck = deck::Deck::open(&open, source)?;
+    wire.send(2, 0, &serde_json::to_vec(&deck.metadata())?)?;
     let mut encoder = Encoder::new(48_000, Channels::Stereo, Application::Audio)?;
     encoder.set_bitrate(opus::Bitrate::Bits(96_000))?;
-    let mut resampler = if rate != 48_000 {
-        Some(RateConverter::new(rate)?)
-    } else {
-        None
-    };
-    let mut decoded = pcm::StereoInput::new(rate, channels);
-    let mut input: [VecDeque<f32>; 2] = [VecDeque::new(), VecDeque::new()];
-    let mut output: VecDeque<[f32; 2]> = VecDeque::with_capacity(1920);
-    let mut eof = false;
-    let mut emitted_samples = 0_u64;
-    let end_ms = open.end_time.map_or(length_ms, |end| {
-        if length_ms > 0 {
-            end.min(length_ms)
-        } else {
-            end
-        }
-    });
-    let mut timescale = timescale::Timescale::new(&open.filters);
-    let expected_samples = if let Some(total) = opus_samples {
-        let end = open
-            .end_time
-            .map_or(total, |end| total.min(end.saturating_mul(48)));
-        Some(
-            (end.saturating_sub(open.position.saturating_mul(48)) as f64 / timescale.speed).round()
-                as u64,
-        )
-    } else if end_ms > 0 {
-        Some((end_ms.saturating_sub(open.position) as f64 * 48. / timescale.speed).round() as u64)
-    } else {
-        None
-    };
     let mut dsp = dsp::Dsp::new(open.filters);
 
     while running.load(Ordering::Acquire) {
@@ -209,105 +124,19 @@ fn run(
         if !running.load(Ordering::Acquire) {
             break;
         }
-        if expected_samples.is_some_and(|n| emitted_samples >= n) {
+        let Some(mut frame) = deck.frame()? else {
             wire.send(6, 0, &[])?;
             break;
-        }
-        while output.len() < 960 && !eof {
-            match format.next_packet() {
-                Ok(packet) if packet.track_id() == track_id => {
-                    let audio = decoder.decode(&packet)?;
-                    let frames = decoded.frames(audio, &mut skip_samples)?;
-                    if resampler.is_none() {
-                        timescale.feed(frames, &mut output)?;
-                    } else {
-                        for frame in frames {
-                            input[0].push_back(frame[0]);
-                            input[1].push_back(frame[1]);
-                        }
-                    }
-                }
-                Ok(_) => continue,
-                Err(Error::IoError(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                    eof = true
-                }
-                Err(err) => return Err(err.into()),
-            }
-            if let Some(resampler) = &mut resampler {
-                let needed = resampler.engine.input_frames_next();
-                while input[0].len() >= needed || (eof && !input[0].is_empty()) {
-                    for (channel, block) in resampler.input.iter_mut().enumerate() {
-                        for sample in &mut block[..needed] {
-                            *sample = input[channel].pop_front().unwrap_or(0.);
-                        }
-                    }
-                    let (_, written) = resampler.engine.process_into_buffer(
-                        &resampler.input,
-                        &mut resampler.output,
-                        None,
-                    )?;
-                    let delay = &mut resampler.delay;
-                    let converted = &resampler.output;
-                    let frames = converted[0][..written]
-                        .iter()
-                        .zip(&converted[1][..written])
-                        .filter_map(|(&left, &right)| {
-                            if *delay > 0 {
-                                *delay -= 1;
-                                None
-                            } else {
-                                Some([left, right])
-                            }
-                        });
-                    timescale.feed(frames, &mut output)?;
-                }
-                if eof
-                    && expected_samples.is_some_and(|n| emitted_samples + (output.len() as u64) < n)
-                {
-                    for block in &mut resampler.input {
-                        block.fill(0.);
-                    }
-                    let (_, written) = resampler.engine.process_into_buffer(
-                        &resampler.input,
-                        &mut resampler.output,
-                        None,
-                    )?;
-                    let converted = &resampler.output;
-                    timescale.feed(
-                        converted[0][..written]
-                            .iter()
-                            .zip(&converted[1][..written])
-                            .map(|(&left, &right)| [left, right]),
-                        &mut output,
-                    )?;
-                }
-            }
-            if eof {
-                timescale.flush(&mut output)?;
-            }
-        }
-        let available = expected_samples.map_or(output.len(), |n| {
-            output.len().min(n.saturating_sub(emitted_samples) as usize)
-        });
-        if available == 0 && eof {
-            wire.send(6, 0, &[])?;
-            break;
-        }
-        let valid = available.min(960);
-        let mut pcm = [0.; 1920];
-        for frame in pcm[..valid * 2].chunks_exact_mut(2) {
-            let mut sample = output.pop_front().ok_or("PCM buffer invariant")?;
-            dsp.process(&mut sample, gain);
-            frame.copy_from_slice(&sample);
+        };
+        for sample in frame.samples[..frame.valid * 2].chunks_exact_mut(2) {
+            let mut stereo = [sample[0], sample[1]];
+            dsp.process(&mut stereo, gain);
+            sample.copy_from_slice(&stereo);
         }
         let mut payload = [0; 1034];
-        let bytes = encoder.encode_float(&pcm, &mut payload[10..])?;
-        emitted_samples += valid as u64;
-        let position = (open.position
-            + (emitted_samples as f64 * timescale.speed / 48.).round() as u64)
-            .min(if end_ms > 0 { end_ms } else { u64::MAX });
-        payload[..8].copy_from_slice(&position.to_be_bytes());
-        payload[8..10].copy_from_slice(&(valid as u16).to_be_bytes());
+        let bytes = encoder.encode_float(&frame.samples, &mut payload[10..])?;
+        payload[..8].copy_from_slice(&frame.position.to_be_bytes());
+        payload[8..10].copy_from_slice(&(frame.valid as u16).to_be_bytes());
         wire.send(5, 0, &payload[..10 + bytes])?;
         control
             .0
@@ -324,7 +153,7 @@ fn main() {
         std::process::exit(1);
     }
 }
-fn main_result() -> Result<(), Box<dyn std::error::Error>> {
+fn main_result() -> Result<(), deck::AudioError> {
     let mut input = io::stdin().lock();
     let first = protocol::read_packet(&mut input)?;
     if first[1] != 1 {
@@ -339,10 +168,18 @@ fn main_result() -> Result<(), Box<dyn std::error::Error>> {
             limit: 0,
             emitted: 0,
             gain: open.gain,
+            commands: VecDeque::new(),
+            revision: 0,
         }),
         Condvar::new(),
     ));
-    let (responses, received) = mpsc::sync_channel(1);
+    let (responses_a, received_a) = mpsc::sync_channel(1);
+    let (responses_b, received_b) = mpsc::sync_channel(1);
+    let responses = [responses_a, responses_b];
+    let slots = [
+        source::Slot::new(0, received_a),
+        source::Slot::new(1, received_b),
+    ];
     let engine_control = control.clone();
     let engine_running = running.clone();
     let engine_wire = wire.clone();
@@ -350,7 +187,7 @@ fn main_result() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = run(
             open,
             engine_wire.clone(),
-            received,
+            slots,
             engine_running,
             engine_control,
         ) {
@@ -369,7 +206,8 @@ fn main_result() -> Result<(), Box<dyn std::error::Error>> {
         match packet[1] {
             4 => {
                 let request = u64::from_be_bytes(packet[36..44].try_into()?);
-                if packet.len() > 65_536 + 44 || responses.send((request, packet)).is_err() {
+                let slot = (request >> 63) as usize;
+                if packet.len() > 65_536 + 44 || responses[slot].send((request, packet)).is_err() {
                     break;
                 }
             }
@@ -380,6 +218,25 @@ fn main_result() -> Result<(), Box<dyn std::error::Error>> {
                     break;
                 }
                 state.limit = limit;
+                state.revision = state.revision.wrapping_add(1);
+                control.1.notify_one();
+            }
+            11..=14 => {
+                let command = match packet[1] {
+                    11 => swapping::Command::Next(serde_json::from_slice(&packet[44..])?),
+                    12 if packet.len() == 52 => {
+                        swapping::Command::Cancel(u64::from_be_bytes(packet[44..52].try_into()?))
+                    }
+                    13 => swapping::Command::Settings(serde_json::from_slice(&packet[44..])?),
+                    14 if packet.len() == 44 => swapping::Command::Skip,
+                    _ => break,
+                };
+                let mut state = control.0.lock().map_err(|_| "control lock poisoned")?;
+                if state.commands.len() >= 8 {
+                    break;
+                }
+                state.commands.push_back(command);
+                state.revision = state.revision.wrapping_add(1);
                 control.1.notify_one();
             }
             10 if packet.len() == 48 => {

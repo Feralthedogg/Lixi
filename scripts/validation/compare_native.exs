@@ -1,7 +1,8 @@
 defmodule Lixi.Validation.NativeComparison do
   def run([baseline, candidate]) do
-    directory =
-      Path.expand("test/tmp/native-compare-#{Base.encode16(:crypto.strong_rand_bytes(6))}")
+    run = Base.encode16(:crypto.strong_rand_bytes(6))
+    directory = Path.expand("test/tmp/native-compare-#{run}")
+    runtime = Path.expand("test/runtime/native-compare-#{run}")
 
     File.mkdir_p!(directory)
     wav = Path.join(directory, "48k.wav")
@@ -31,7 +32,7 @@ defmodule Lixi.Validation.NativeComparison do
       lixi: [
         source_roots: [directory],
         start_server: false,
-        data_dir: Path.expand("test/runtime/native-compare-#{run}")
+        data_dir: runtime
       ]
     )
 
@@ -63,6 +64,7 @@ defmodule Lixi.Validation.NativeComparison do
     after
       Application.stop(:lixi)
       File.rm_rf!(directory)
+      File.rm_rf!(runtime)
     end
   end
 
