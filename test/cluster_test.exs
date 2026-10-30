@@ -181,7 +181,10 @@ defmodule Lixi.ClusterTest do
     )
 
     assert :peer.call(c, Process, :alive?, [sender])
-    assert :peer.call(c, :sys, :get_state, [before.connection]).frames > frames_before + 10
+
+    eventually(fn ->
+      :peer.call(c, :sys, :get_state, [before.connection]).frames > frames_before + 10
+    end)
 
     assert {:error, :unavailable} = :peer.call(a, Lixi.Sessions, :destroy, [id, "456"])
     assert {:ok, ^player} = :peer.call(a, Lixi.Sessions, :player, [id, "456"])
