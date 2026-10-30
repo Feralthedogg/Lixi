@@ -19,6 +19,7 @@ config :lixi,
   source_roots: [],
   http_sources: false,
   player_update_interval: 5_000,
+  websocket_ping_interval: 15_000,
   voice_module: Lixi.Voice.EDA
 
 config :logger, level: :info

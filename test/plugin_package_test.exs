@@ -342,7 +342,7 @@ defmodule Lixi.PluginPackageTest do
     Application.load(:lixi)
     Application.put_all_env(lixi: [data_dir: root, cluster_enabled: false, start_server: false,
       max_players: 10, max_workers: 2, max_probe_workers: 2, max_sessions: 10, voice_module: Lixi.TestVoice,
-      player_update_interval: 50])
+      player_update_interval: 50, websocket_ping_interval: 15_000])
     {:ok, _} = Application.ensure_all_started(:lixi)
     result = Lixi.Plugins.request("packaged_fixture", %{method: "GET", path: ["health"]})
     case {expected, result} do

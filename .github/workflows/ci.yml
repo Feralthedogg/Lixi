@@ -145,6 +145,7 @@ jobs:
               test/plugin_package_test.exs test/plugins_test.exs \
               test/sessions_test.exs test/operations_test.exs \
               test/admission_test.exs test/metrics_test.exs test/audio_test.exs \
+              test/web_socket_test.exs test/validation_test.exs test/voice_test.exs \
               --seed "$seed" --max-cases 8 \
               2>&1 | tee "test/tmp/ci-logs/faults-$seed.log"
           done

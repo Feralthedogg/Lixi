@@ -49,7 +49,7 @@ pub(crate) fn read_tag<R: ReadBytes>(mut reader: R) -> Result<(u32, u32, bool)> 
             .filter(|ty| ty.is_top_level());
 
         if let Some(ty) = ty {
-            log::info!("found next supported tag {:08X} ({:?})", tag, ty);
+            log::info!("found next supported tag {tag:08X} ({ty:?})");
             return Ok((tag, 4, true));
         }
         tag = (tag << 8) | u32::from(reader.read_u8()?);
@@ -409,7 +409,7 @@ impl<R: ReadBytes> ElementIterator<R> {
             }
 
             if header.etype != E::ID {
-                log::warn!("found element with invalid type {:?}", header);
+                log::warn!("found element with invalid type {header:?}");
                 self.ignore_data()?;
                 continue;
             }
@@ -477,7 +477,7 @@ impl<R: ReadBytes> ElementIterator<R> {
                 );
                 if let (Some(cur), Some(end)) = (self.current, self.end) {
                     if cur.pos + cur.len > end {
-                        log::debug!("reading element data {:?}; parent end={}", cur, end);
+                        log::debug!("reading element data {cur:?}; parent end={end}");
                         return decode_error(
                             "mkv: attempt to read element data past master element ",
                         );

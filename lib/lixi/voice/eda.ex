@@ -20,6 +20,8 @@ defmodule Lixi.Voice.EDA do
         transport: nil,
         packet: Packet.new(),
         manager: nil,
+        early_mls: :queue.new(),
+        early_mls_bytes: 0,
         ready: false,
         epoch: 0,
         seq: -1,
@@ -159,9 +161,14 @@ defmodule Lixi.Voice.EDA do
 
   def handle_frame(_, state), do: {:ok, state}
 
-  defp numbered(op, data, nil, state), do: dispatch(op, data, state)
+  defp numbered(op, data, nil, state) do
+    gateway_event(op, nil, state)
+    dispatch(op, data, state)
+  end
 
   defp numbered(op, data, seq, state) when is_integer(seq) and seq in 0..65_535 do
+    gateway_event(op, seq, state)
+
     if MapSet.member?(state.seen, seq) do
       {:ok, state}
     else
@@ -181,6 +188,28 @@ defmodule Lixi.Voice.EDA do
   end
 
   defp numbered(_, _, _, state), do: {:close, {4002, "Invalid voice sequence"}, state}
+
+  defp gateway_event(op, seq, state) do
+    :telemetry.execute([:lixi, :voice, :gateway], %{opcode: op}, %{
+      sequence: seq,
+      initialized: state.manager != nil
+    })
+  end
+
+  defp dispatch(op, data, %{manager: nil} = state) when op in 21..31 do
+    bytes = :erlang.external_size(data)
+
+    if :queue.len(state.early_mls) >= 16 or state.early_mls_bytes + bytes > 1_048_576 do
+      {:close, {4002, "Early DAVE event budget exceeded"}, state}
+    else
+      {:ok,
+       %{
+         state
+         | early_mls: :queue.in({op, data}, state.early_mls),
+           early_mls_bytes: state.early_mls_bytes + bytes
+       }}
+    end
+  end
 
   defp dispatch(8, %{"heartbeat_interval" => interval}, state)
        when is_number(interval) and interval >= 100 do
@@ -263,6 +292,22 @@ defmodule Lixi.Voice.EDA do
   defp dispatch(13, %{"user_id" => id}, state),
     do: {:ok, %{state | clients: MapSet.delete(state.clients, to_string(id))}}
 
+  defp dispatch(24, %{"epoch" => 1} = data, %{manager: %Manager{} = manager} = state) do
+    send(state.owner, {:voice, self(), :buffering})
+    version = Map.get(data, "protocol_version", manager.protocol_version)
+    state = %{state | ready: false, pending_transition: true}
+
+    with true <- is_integer(version) and version in 1..Native.max_protocol_version(),
+         :ok <- Native.reinit(manager.mls_session, version, manager.user_id, manager.channel_id),
+         manager = %{manager | protocol_version: version, pending_epoch: 1, transition_id: nil},
+         {:ok, payload} <- Manager.key_package_payload(manager) do
+      send(self(), {:outbound, payload})
+      {:ok, %{state | manager: manager}}
+    else
+      _ -> {:close, {4017, "DAVE epoch initialization failed"}, state}
+    end
+  end
+
   defp dispatch(op, data, %{manager: %Manager{} = manager} = state) when op in 21..31 do
     # davey 0.1 mutates sender state during commit preparation. Keep the gate
     # closed until Execute rather than sending with a prepared, uncommitted key.
@@ -312,9 +357,25 @@ defmodule Lixi.Voice.EDA do
           ready: false
       }
 
-      case Manager.key_package_payload(manager) do
-        {:ok, payload} -> reply(payload, state)
-        _ -> {:close, {4017, "DAVE initialization failed"}, state}
+      early = :queue.to_list(state.early_mls)
+      state = %{state | early_mls: :queue.new(), early_mls_bytes: 0}
+
+      replay =
+        Enum.reduce_while(early, {:ok, state}, fn {op, data}, {:ok, current} ->
+          case dispatch(op, data, current) do
+            {:ok, next} -> {:cont, {:ok, next}}
+            closed -> {:halt, closed}
+          end
+        end)
+
+      case replay do
+        {:ok, state} ->
+          # OP25 supplies the external sender and emits exactly one key package.
+          # An extra package before OP25 creates competing joins for this member.
+          {:ok, state}
+
+        closed ->
+          closed
       end
     end
   end

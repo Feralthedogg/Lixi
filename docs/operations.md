@@ -148,7 +148,8 @@ coverage, interval, memory components, capacity, and cumulative counters.
 WebSocket `frameStats` reports a rolling minute of sent/nulled frames and deficit
 against active playback time. The REST field remains null for Lavalink
 compatibility. Admin counters also include late frame intervals, underruns,
-send failures, Voice reconnects, and observed DAVE prepare/ready events.
+send failures, expired frame deadlines, Voice reconnects, and observed DAVE
+prepare/ready events.
 `nulled` stays zero because the Player does not synthesize null media frames.
 On macOS, `systemLoad` is normalized one-minute load average; admin metrics name
 that basis. Application CPU uses recent process CPU deltas on both platforms.
@@ -172,12 +173,18 @@ elixir -pa "_build/dev/lib/*/ebin" scripts/validation/discord_soak.exs /path/to/
 elixir -pa "_build/dev/lib/*/ebin" scripts/validation/discord_soak.exs /path/to/private/.env
 ```
 
-The default soak lasts 1,800 seconds and rejoins Voice every 300 seconds.
+The bounded soak lasts 1,800 seconds and rejoins Voice every 300 seconds.
 `--check` verifies the bot and target without joining Voice; `--loop` repeats
-until stopped. Tracks advance on TrackEnd and wrap at the end of the list.
+until stopped and writes a checkpoint every1,800 seconds without ending playback.
+`--shuffle` or `SHUFFLE_PLAYLIST=true` shuffles each complete round, retaining
+every entry and avoiding the same track across round boundaries where possible.
+Continuous playback does not intentionally rejoin Voice; add `--reconnect-test`
+only when testing reconnects.
+Tracks advance on TrackEnd. Failed acquisitions skip to the next entry.
 `YOUTUBE_PLAYLIST_URL` optionally selects a public playlist using `tools/yt-dlp`
 beside the private `.env`. The client fetches one Opus/WebM file at a time, with
 a 32 MiB / 120-second per-track bound, and removes its own temporary media.
+Acquisition runs off the Gateway/control loop.
 Downloads can introduce gaps between tracks. Reports stay beside the private
 configuration. Peer DAVE transitions require participant changes; solo playback
 and successful UDP sends do not verify remote audibility.

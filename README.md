@@ -159,9 +159,9 @@ release startup with plugin restoration.
   playlist with yt-dlp and repeat its tracks.
 - Raft does not replicate audio, Voice secrets, DAVE resources, or durable copies
   of every session. Network uncertainty does not trigger a second Voice sender.
-- macOS arm64 is locally verified. Live Discord channel transmission,
-  cross-host TLS, production load, and the supplied Linux/Kubernetes deployment
-  examples remain unverified.
+- Encrypted media waits for a compatible DAVE group; a solo connection can stay
+  pending until another participant joins. Cross-host TLS, production capacity,
+  and the supplied Linux/Kubernetes deployment examples remain unverified.
 
 ## Documentation
 

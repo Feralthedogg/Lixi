@@ -7,6 +7,7 @@ defmodule Lixi.Metrics do
     :sent,
     :nulled,
     :late,
+    :expired,
     :underruns,
     :send_errors,
     :voice_reconnects,

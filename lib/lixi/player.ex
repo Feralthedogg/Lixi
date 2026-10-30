@@ -611,6 +611,7 @@ defmodule Lixi.Player do
         |> schedule_at(due + 20_000)
 
       {:error, :expired} ->
+        Lixi.Metrics.record(:expired)
         schedule(state, 20_000)
 
       {:error, :not_ready} ->

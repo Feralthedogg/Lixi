@@ -337,7 +337,7 @@ impl MkvReader {
                 self.current_cluster = None;
             }
             other => {
-                log::debug!("ignored element {:?}", other);
+                log::debug!("ignored element {other:?}");
                 self.iter.ignore_data()?;
             }
         }
@@ -360,7 +360,7 @@ impl FormatReader for MkvReader {
                 .byte_len()
                 .ok_or(Error::SeekError(SeekErrorKind::Unseekable))?;
             reader.seek(SeekFrom::Start(pos))?;
-            log::info!("stream is seekable with len={} bytes.", len);
+            log::info!("stream is seekable with len={len} bytes.");
             Some(len)
         } else {
             None
@@ -443,7 +443,7 @@ impl FormatReader for MkvReader {
                 }
                 other => {
                     it.ignore_data()?;
-                    log::debug!("ignored element {:?}", other);
+                    log::debug!("ignored element {other:?}");
                 }
             }
         }
@@ -548,9 +548,8 @@ impl FormatReader for MkvReader {
                     6 => Some(Layout::FivePointOne),
                     other => {
                         log::warn!(
-                            "track #{} has custom number of channels: {}",
-                            track.number,
-                            other
+                            "track #{} has custom number of channels: {other}",
+                            track.number
                         );
                         None
                     }

@@ -1,4 +1,5 @@
 Code.require_file("watch.exs", __DIR__)
+Code.require_file("playlist.exs", __DIR__)
 
 defmodule Lixi.Validation.Socket do
   use WebSockex
@@ -9,7 +10,17 @@ defmodule Lixi.Validation.Socket do
   end
 
   def handle_cast(:close, owner), do: {:close, owner}
-  def handle_disconnect(_, owner), do: {:ok, owner}
+
+  def handle_disconnect(info, owner) do
+    code =
+      case info do
+        %{reason: {:remote, code, _}} when is_integer(code) -> code
+        _ -> "unknown"
+      end
+
+    send(owner, {:lavalink_disconnected, code})
+    {:ok, owner}
+  end
 end
 
 defmodule Lixi.Validation.Consumer do
@@ -24,7 +35,7 @@ defmodule Lixi.Validation.Consumer do
 end
 
 defmodule Lixi.Validation.Soak do
-  alias Lixi.Validation.Watch
+  alias Lixi.Validation.{Playlist, Watch}
 
   def run([file | arguments]) do
     config =
@@ -69,6 +80,8 @@ defmodule Lixi.Validation.Soak do
 
   defp soak(config, bot, private, repeat) do
     Process.register(self(), :lixi_validation)
+    owner = self()
+    System.trap_signal(:sigterm, fn -> send(owner, :validation_stop) end)
     origin = config["LIXI_URL"] || "http://127.0.0.1:2333"
     password = Map.fetch!(config, "LIXI_PASSWORD")
     headers = [{"Authorization", password}, {"User-Id", bot}, {"Client-Name", "lixi-soak/1.0"}]
@@ -140,13 +153,17 @@ defmodule Lixi.Validation.Soak do
       guild: guild,
       channel: channel,
       bot: bot,
-      playlist: playlist,
-      index: 0,
+      playlist:
+        Playlist.new(
+          playlist,
+          "--shuffle" in System.argv() or config["SHUFFLE_PLAYLIST"] == "true"
+        ),
       extractor: extractor,
       media_dir: media_dir,
       media_file: nil,
       media_task: nil,
       source_failures: 0,
+      consecutive_failures: 0,
       voice_session: nil,
       voice_server: nil,
       joined: false,
@@ -156,8 +173,10 @@ defmodule Lixi.Validation.Soak do
       startup_deadline: started + 150_000,
       until: if(repeat, do: :infinity, else: :starting),
       duration_ms: seconds * 1000,
+      checkpoint_due: :pending,
       next_reconnect: :pending,
-      reconnect_ms: reconnect * 1000,
+      reconnect_ms:
+        if(not repeat or "--reconnect-test" in System.argv(), do: reconnect * 1000, else: 0),
       tracks: 0,
       exceptions: 0,
       close_events: 0,
@@ -182,7 +201,7 @@ defmodule Lixi.Validation.Soak do
         |> Map.merge(Watch.summary(result.watch))
         |> Map.put(
           :elapsedSeconds,
-          div(System.monotonic_time(:millisecond) - result.first_frame, 1000)
+          div(System.monotonic_time(:millisecond) - (result.first_frame || started), 1000)
         )
         |> Map.put(
           :daveCoverage,
@@ -223,8 +242,29 @@ defmodule Lixi.Validation.Soak do
       is_integer(state.until) and now >= state.until ->
         state
 
+      state.first_frame == nil and now >= state.startup_deadline and state.until == :infinity ->
+        IO.puts("Waiting for a DAVE group and media recipient")
+        loop(%{state | startup_deadline: now + 300_000})
+
       state.first_frame == nil and now >= state.startup_deadline ->
         raise("No media delivered before startup deadline")
+
+      state.until == :infinity and is_integer(state.checkpoint_due) and
+          now >= state.checkpoint_due ->
+        report =
+          Map.merge(Watch.summary(state.watch), %{
+            passed: Watch.passed?(state.watch) and state.exceptions == 0,
+            elapsedSeconds: div(now - state.first_frame, 1000),
+            tracks: state.tracks,
+            source_failures: state.source_failures,
+            rounds: state.playlist.rounds,
+            shuffled: state.playlist.shuffle,
+            metrics: state.metrics,
+            daveCoverage: "Protocol counters observed; receiver listening confirmed separately"
+          })
+
+        write_report(Path.dirname(state.media_dir) |> Path.dirname(), report)
+        loop(%{state | checkpoint_due: now + state.duration_ms})
 
       not state.joined and now >= state.join_deadline ->
         raise("Discord voice join/rejoin timed out")
@@ -297,6 +337,8 @@ defmodule Lixi.Validation.Soak do
           %{state | leave_pending: false, voice_session: nil, voice_server: nil}
 
         data["channel_id"] == state.channel ->
+          participants = length(EDA.Cache.VoiceState.for_channel(state.guild, state.channel))
+          IO.puts("Voice participants observed: #{participants}")
           attach(%{state | voice_session: data["session_id"]})
 
         true ->
@@ -320,7 +362,9 @@ defmodule Lixi.Validation.Soak do
           state
           | first_frame: now,
             until: if(state.until == :infinity, do: :infinity, else: now + state.duration_ms),
-            next_reconnect: now + state.reconnect_ms
+            checkpoint_due: now + state.duration_ms,
+            next_reconnect:
+              if(state.reconnect_ms > 0, do: now + state.reconnect_ms, else: :disabled)
         }
       else
         state
@@ -336,7 +380,7 @@ defmodule Lixi.Validation.Soak do
 
     play(%{
       state
-      | index: rem(state.index + 1, length(state.playlist)),
+      | playlist: Playlist.next(state.playlist),
         watch: %{state.watch | last_position: nil}
     })
   end
@@ -355,20 +399,24 @@ defmodule Lixi.Validation.Soak do
     case result do
       {:ok, identifier, media_file} ->
         request!(:patch, state.endpoint, state.auth, %{track: %{identifier: identifier}})
-        %{state | tracks: state.tracks + 1, media_file: media_file}
+        %{state | tracks: state.tracks + 1, media_file: media_file, consecutive_failures: 0}
 
       :error ->
-        if state.source_failures + 1 >= length(state.playlist),
+        if state.consecutive_failures + 1 >= Playlist.size(state.playlist),
           do: raise("No playlist media could be acquired")
 
         play(%{
           state
-          | index: rem(state.index + 1, length(state.playlist)),
-            source_failures: state.source_failures + 1
+          | playlist: Playlist.next(state.playlist),
+            source_failures: state.source_failures + 1,
+            consecutive_failures: state.consecutive_failures + 1
         })
     end
   end
 
+  defp handle(:validation_stop, state, now), do: %{state | until: now}
+
+  defp handle({:lavalink_disconnected, code}, _, _), do: raise("Lixi WebSocket closed: #{code}")
   defp handle(_, state, _), do: state
 
   defp attach(%{joined: false, voice_session: session, voice_server: server} = state)
@@ -392,7 +440,7 @@ defmodule Lixi.Validation.Soak do
 
   defp play(state) do
     if state.media_file, do: File.rm!(state.media_file)
-    identifier = Enum.at(state.playlist, state.index)
+    identifier = Playlist.current(state.playlist)
 
     task =
       Task.async(fn ->
@@ -460,7 +508,7 @@ defmodule Lixi.Validation.Soak do
         if data == "", do: %{}, else: Jason.decode!(data)
 
       {:ok, {{_, status, _}, _, _}} ->
-        raise("HTTP #{status} during validation")
+        raise("HTTP #{status} for #{method} #{URI.parse(url).path} during validation")
 
       _ ->
         raise("HTTP transport failed during validation")

@@ -5,6 +5,7 @@ defmodule Lixi.WebSocket do
     case Lixi.Sessions.connect(user, self(), previous) do
       {:ok, id, resumed, events} ->
         Process.send_after(self(), :stats, 60_000)
+        Process.send_after(self(), :ping, Application.fetch_env!(:lixi, :websocket_ping_interval))
 
         frames =
           for event <- [%{op: "ready", resumed: resumed, sessionId: id} | events],
@@ -26,6 +27,11 @@ defmodule Lixi.WebSocket do
   def handle_in(_, state), do: {:ok, state}
   @impl true
   def handle_info({:lixi_event, event}, state), do: {:push, {:text, Jason.encode!(event)}, state}
+
+  def handle_info(:ping, state) do
+    Process.send_after(self(), :ping, Application.fetch_env!(:lixi, :websocket_ping_interval))
+    {:push, {:ping, <<>>}, state}
+  end
 
   def handle_info(:stats, state) do
     Process.send_after(self(), :stats, 60_000)

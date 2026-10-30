@@ -19,12 +19,14 @@ defmodule Lixi.Voice.Packet do
         transport,
         encrypt,
         udp_send,
-        now \\ System.monotonic_time(:microsecond)
+        _wall_time \\ nil
       ) do
     if state.nonce >= 0x100000000 do
       {:error, :nonce_exhausted, state}
     else
-      slot = max(state.slot + 1, div(max(0, now - state.origin), 20_000))
+      # RTP counts encoded samples. Wall-clock buckets introduce audible holes
+      # when small scheduling jitter crosses a bucket boundary.
+      slot = state.slot + 1
       timestamp = state.timestamp_base + slot * 960 &&& 0xFFFFFFFF
 
       next = %{
