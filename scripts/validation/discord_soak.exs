@@ -589,13 +589,15 @@ defmodule Lixi.Validation.Soak do
         else
           request!(:patch, state.endpoint, state.auth, %{track: %{identifier: identifier}})
 
-          %{
+          state = %{
             state
             | tracks: state.tracks + 1,
               media_file: media_file,
               current_identifier: identifier,
               consecutive_failures: 0
           }
+
+          if state.swapping, do: prefetch(state), else: state
         end
 
       :error ->
