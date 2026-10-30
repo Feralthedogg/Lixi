@@ -101,7 +101,9 @@ jobs:
           path: |
             deps
             native/audio_engine/target
-          key: ci-${{ runner.os }}-${{ runner.arch }}-otp29.1.2-elixir1.20.4-rust${{ matrix.rust }}-${{ hashFiles('mix.lock', 'native/audio_engine/Cargo.lock') }}
+          key: ci-${{ runner.os }}-${{ runner.arch }}-otp29.1.2-elixir1.20.4-rust${{ matrix.rust }}-${{ hashFiles('mix.lock', 'native/audio_engine/Cargo.toml', 'native/audio_engine/Cargo.lock') }}
+          restore-keys: |
+            ci-${{ runner.os }}-${{ runner.arch }}-otp29.1.2-elixir1.20.4-rust${{ matrix.rust }}-
 
       - name: Fetch locked dependencies
         run: |
